@@ -1,0 +1,13 @@
+#include <windows.h>
+#include <ntverp.h>
+
+#include "..\..\build\vendor.ver"
+
+#undef  VER_FILEDESCRIPTION_STR
+#undef  VER_INTERNALNAME_STR
+
+#define VENDOR_VIRTIO_PRODUCT      "XCB Virtio Audio Device"
+#define VER_FILEDESCRIPTION_STR    "XCB Virtio Audio Driver"
+#define VER_INTERNALNAME_STR       "viosnd.sys"
+
+#include "common.ver"

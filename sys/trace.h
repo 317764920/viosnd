@@ -1,0 +1,12 @@
+#pragma once
+
+#define WPP_CONTROL_GUIDS \
+    WPP_DEFINE_CONTROL_GUID(VIOSNDTraceGuid, (4D1B5BB7, 453D, 4E76, 9E2B, 1AF0422F1A11), \
+        WPP_DEFINE_BIT(DBG_INIT) \
+        WPP_DEFINE_BIT(DBG_PNP) \
+        WPP_DEFINE_BIT(DBG_POWER) \
+        WPP_DEFINE_BIT(DBG_HW) \
+        WPP_DEFINE_BIT(DBG_STREAM))
+
+#define WPP_LEVEL_FLAGS_LOGGER(lvl, flags) WPP_LEVEL_LOGGER(flags)
+#define WPP_LEVEL_FLAGS_ENABLED(lvl, flags) (WPP_LEVEL_ENABLED(flags) && WPP_CONTROL(WPP_BIT_ ## flags).Level >= lvl)

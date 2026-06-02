@@ -1,0 +1,146 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="14.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Win10 Release|ARM64">
+      <Configuration>Win10 Release</Configuration>
+      <Platform>ARM64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Win10 Release|Win32">
+      <Configuration>Win10 Release</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Win10 Release|x64">
+      <Configuration>Win10 Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Win11 Release|ARM64">
+      <Configuration>Win11 Release</Configuration>
+      <Platform>ARM64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Win11 Release|Win32">
+      <Configuration>Win11 Release</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Win11 Release|x64">
+      <Configuration>Win11 Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{4D11643E-5172-4D7D-98C0-69F7E0EB2B25}</ProjectGuid>
+    <TemplateGuid>{dd38f7fc-d7bd-488b-9242-7d8754cde80d}</TemplateGuid>
+    <TargetFrameworkVersion>v4.5.2</TargetFrameworkVersion>
+    <MinimumVisualStudioVersion>11.0</MinimumVisualStudioVersion>
+    <Configuration>Win10 Release</Configuration>
+    <Platform Condition="'$(Platform)' == ''">Win32</Platform>
+    <SignMode>Off</SignMode>
+  </PropertyGroup>
+  <PropertyGroup Label="Globals">
+    <RootNamespace>viosnd</RootNamespace>
+    <WindowsTargetPlatformVersion>$(LatestTargetPlatformVersion)</WindowsTargetPlatformVersion>
+    <SourceInfFile>viosnd.inx</SourceInfFile>
+  </PropertyGroup>
+  <PropertyGroup Label="Configuration">
+    <TargetVersion>Windows10</TargetVersion>
+    <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <DriverTargetPlatform>Desktop</DriverTargetPlatform>
+  </PropertyGroup>
+  <PropertyGroup Label="PropertySheets">
+    <ConfigurationType>Driver</ConfigurationType>
+    <DriverType>WDM</DriverType>
+  </PropertyGroup>
+  <Import Project="$(MSBuildProjectDirectory)\viosnd.props" />
+  <Import Project="$(MSBuildProjectDirectory)\..\..\build\Driver.Common.props" />
+  <PropertyGroup>
+    <DriverTargetPlatform>Desktop</DriverTargetPlatform>
+  </PropertyGroup>
+  <ImportGroup Label="ExtensionSettings" />
+  <ImportGroup Label="PropertySheets">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+  <PropertyGroup>
+    <DebuggerFlavor>DbgengKernelDebugger</DebuggerFlavor>
+    <TargetName>viosnd</TargetName>
+    <TargetExt>.sys</TargetExt>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Win10 Release|Win32'">
+    <OutDir>objfre_win10_x86\i386\</OutDir>
+    <IntDir>objfre_win10_x86\i386\</IntDir>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Win11 Release|Win32'">
+    <OutDir>objfre_win11_x86\i386\</OutDir>
+    <IntDir>objfre_win11_x86\i386\</IntDir>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Win10 Release|x64'">
+    <OutDir>objfre_win10_amd64\amd64\</OutDir>
+    <IntDir>objfre_win10_amd64\amd64\</IntDir>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Win11 Release|x64'">
+    <OutDir>objfre_win11_amd64\amd64\</OutDir>
+    <IntDir>objfre_win11_amd64\amd64\</IntDir>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Win10 Release|ARM64'">
+    <OutDir>objfre_win10_arm64\arm64\</OutDir>
+    <IntDir>objfre_win10_arm64\arm64\</IntDir>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Win11 Release|ARM64'">
+    <OutDir>objfre_win11_arm64\arm64\</OutDir>
+    <IntDir>objfre_win11_arm64\arm64\</IntDir>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <WppEnabled>false</WppEnabled>
+      <WppScanConfigurationData>trace.h</WppScanConfigurationData>
+      <WppKernelMode>true</WppKernelMode>
+      <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories);..\..\VirtIO</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>%(PreprocessorDefinitions);POOL_NX_OPTIN=1</PreprocessorDefinitions>
+      <WarningLevel>Level3</WarningLevel>
+    </ClCompile>
+    <Link>
+      <AdditionalDependencies>%(AdditionalDependencies);virtiolib.lib;ntoskrnl.lib;wdm.lib;portcls.lib;ks.lib</AdditionalDependencies>
+      <AdditionalLibraryDirectories Condition="'$(Configuration)|$(Platform)'=='Win10 Release|Win32'">..\..\VirtIO\objfre_win10_x86\i386;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories Condition="'$(Configuration)|$(Platform)'=='Win11 Release|Win32'">..\..\VirtIO\objfre_win11_x86\i386;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories Condition="'$(Configuration)|$(Platform)'=='Win10 Release|x64'">..\..\VirtIO\objfre_win10_amd64\amd64;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories Condition="'$(Configuration)|$(Platform)'=='Win11 Release|x64'">..\..\VirtIO\objfre_win11_amd64\amd64;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories Condition="'$(Configuration)|$(Platform)'=='Win10 Release|ARM64'">..\..\VirtIO\objfre_win10_arm64\arm64;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories Condition="'$(Configuration)|$(Platform)'=='Win11 Release|ARM64'">..\..\VirtIO\objfre_win11_arm64\arm64;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <OptimizeReferences>true</OptimizeReferences>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <FilesToPackage Include="$(TargetPath)" />
+    <FilesToPackage Include="@(Inf->'%(CopyOutput)')" Condition="'@(Inf)'!=''" />
+  </ItemGroup>
+  <ItemGroup>
+    <Inf Include="viosnd.inx" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="Adapter.cpp" />
+    <ClCompile Include="Driver.cpp" />
+    <ClCompile Include="ViosndDebug.cpp" />
+    <ClCompile Include="ViosndGuids.cpp" />
+    <ClCompile Include="ViosndPcm.cpp" />
+    <ClCompile Include="ViosndTopology.cpp" />
+    <ClCompile Include="ViosndVirtio.cpp" />
+    <ClCompile Include="ViosndWaveRT.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="precomp.h" />
+    <ClInclude Include="trace.h" />
+    <ClInclude Include="VirtioSnd.h" />
+    <ClInclude Include="ViosndPcm.h" />
+    <ClInclude Include="ViosndTopology.h" />
+    <ClInclude Include="ViosndVirtio.h" />
+    <ClInclude Include="ViosndWaveRT.h" />
+    <ClInclude Include="viosnd.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="viosnd.rc" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <Import Project="$(MSBuildProjectDirectory)\..\..\build\Driver.Common.targets" />
+  <ImportGroup Label="ExtensionTargets" />
+</Project>

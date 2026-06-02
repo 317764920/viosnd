@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <Feature_AlwaysDefaultVendor>false</Feature_AlwaysDefaultVendor>
+    <Feature_UsingWDF>false</Feature_UsingWDF>
+    <Feature_PackOne>true</Feature_PackOne>
+    <Feature_LegacyStampInf>true</Feature_LegacyStampInf>
+    <Feature_AdjustInfLegacy>true</Feature_AdjustInfLegacy>
+    <Feature_AdjustInf>true</Feature_AdjustInf>
+    <SourceInfFile>viosnd.inx</SourceInfFile>
+    <PackOne_DestinationPrefix>..\</PackOne_DestinationPrefix>
+    <TargetName>viosnd</TargetName>
+    <PackageDir>viosnd</PackageDir>
+  </PropertyGroup>
+</Project>

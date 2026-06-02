@@ -1,0 +1,121 @@
+;/*++
+;
+;Copyright (c) 20??-2025 XCB Inc.
+;
+;
+;Module Name:
+;    viosnd.inf
+;
+;Abstract:
+;    XCB Virtio Audio driver installation file.
+;
+;--*/
+
+[Version]
+Signature       = "$WINDOWS NT$"
+Class           = MEDIA
+ClassGuid       = {4d36e96c-e325-11ce-bfc1-08002be10318}
+Provider        = %VENDOR%
+CatalogFile     = viosnd.cat
+PnpLockdown     = 1
+DriverVer = 05/09/2026,100.6.101.58000
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+viosnd.sys = 1,,
+
+[Manufacturer]
+%VENDOR% = Standard,NTamd64.10.0...16299
+
+[Standard.NTamd64.10.0...16299]
+%XcbVirtioAudio.DeviceDesc% = XcbVirtioAudio_Device, PCI\VEN_1AF4&DEV_1059&SUBSYS_11001AF4&REV_01, PCI\VEN_1AF4&DEV_1059
+
+[XcbVirtioAudio_Device.NT]
+CopyFiles = XcbVirtioAudio_CopyFiles
+
+[XcbVirtioAudio_Device.NT.HW]
+AddReg = XcbVirtioAudio_AddReg
+
+[XcbVirtioAudio_Device.NT.Interfaces]
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_WaveOut%,     XcbVirtioAudio.I.WaveOut
+AddInterface = %KSCATEGORY_RENDER%,   %KSNAME_WaveOut%,     XcbVirtioAudio.I.WaveOut
+AddInterface = %KSCATEGORY_REALTIME%, %KSNAME_WaveOut%,     XcbVirtioAudio.I.WaveOut
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_TopologyOut%, XcbVirtioAudio.I.TopologyOut
+AddInterface = %KSCATEGORY_TOPOLOGY%, %KSNAME_TopologyOut%, XcbVirtioAudio.I.TopologyOut
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_WaveIn%,      XcbVirtioAudio.I.WaveIn
+AddInterface = %KSCATEGORY_CAPTURE%,  %KSNAME_WaveIn%,      XcbVirtioAudio.I.WaveIn
+AddInterface = %KSCATEGORY_REALTIME%, %KSNAME_WaveIn%,      XcbVirtioAudio.I.WaveIn
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_TopologyIn%,  XcbVirtioAudio.I.TopologyIn
+AddInterface = %KSCATEGORY_TOPOLOGY%, %KSNAME_TopologyIn%,  XcbVirtioAudio.I.TopologyIn
+
+[XcbVirtioAudio_CopyFiles]
+viosnd.sys
+
+[XcbVirtioAudio_AddReg]
+HKR,Interrupt Management,,0x00000010
+HKR,Interrupt Management\MessageSignaledInterruptProperties,,0x00000010
+HKR,Interrupt Management\MessageSignaledInterruptProperties,MSISupported,0x00010001,1
+HKR,Interrupt Management\MessageSignaledInterruptProperties,MessageNumberLimit,0x00010001,4
+
+[XcbVirtioAudio.I.WaveOut]
+AddReg = XcbVirtioAudio.I.WaveOut.AddReg
+
+[XcbVirtioAudio.I.WaveOut.AddReg]
+HKR,,FriendlyName,,%XcbVirtioAudio.WaveOut%
+
+[XcbVirtioAudio.I.TopologyOut]
+AddReg = XcbVirtioAudio.I.TopologyOut.AddReg
+
+[XcbVirtioAudio.I.TopologyOut.AddReg]
+HKR,,FriendlyName,,%XcbVirtioAudio.TopologyOut%
+
+[XcbVirtioAudio.I.WaveIn]
+AddReg = XcbVirtioAudio.I.WaveIn.AddReg
+
+[XcbVirtioAudio.I.WaveIn.AddReg]
+HKR,,FriendlyName,,%XcbVirtioAudio.WaveIn%
+
+[XcbVirtioAudio.I.TopologyIn]
+AddReg = XcbVirtioAudio.I.TopologyIn.AddReg
+
+[XcbVirtioAudio.I.TopologyIn.AddReg]
+HKR,,FriendlyName,,%XcbVirtioAudio.TopologyIn%
+
+[XcbVirtioAudio_Device.NT.Services]
+AddService = viosnd,0x00000002,XcbVirtioAudio_Service_Install
+
+[XcbVirtioAudio_Service_Install]
+DisplayName    = %XcbVirtioAudio.Service%
+ServiceType    = 1
+StartType      = 3
+ErrorControl   = 1
+ServiceBinary  = %13%\viosnd.sys
+AddReg         = DmaRemappingCompatible.Reg
+
+[DmaRemappingCompatible.Reg]
+HKR,Parameters,DmaRemappingCompatible,0x00010001,1
+
+[Strings]
+VENDOR  = "INX_COMPANY"
+DiskName                  = "XCB Virtio Audio Installation Disk"
+XcbVirtioAudio.DeviceDesc = "XCB VirtIO Audio Device"
+XcbVirtioAudio.Service    = "XCB VirtIO Audio Service"
+XcbVirtioAudio.WaveOut    = "XCB VirtIO Audio Speaker Wave"
+XcbVirtioAudio.TopologyOut = "XCB VirtIO Audio Speaker"
+XcbVirtioAudio.WaveIn     = "XCB VirtIO Audio Microphone Wave"
+XcbVirtioAudio.TopologyIn = "XCB VirtIO Audio Microphone"
+KSNAME_WaveOut            = "XCBVirtioAudioWaveOut"
+KSNAME_TopologyOut        = "XCBVirtioAudioTopologyOut"
+KSNAME_WaveIn             = "XCBVirtioAudioWaveIn"
+KSNAME_TopologyIn         = "XCBVirtioAudioTopologyIn"
+KSCATEGORY_AUDIO          = "{6994AD04-93EF-11D0-A3CC-00A0C9223196}"
+KSCATEGORY_RENDER         = "{65E8773E-8F56-11D0-A3B9-00A0C9223196}"
+KSCATEGORY_CAPTURE        = "{65E8773D-8F56-11D0-A3B9-00A0C9223196}"
+KSCATEGORY_REALTIME       = "{EB115FFC-10C8-4964-831D-6DCB02E6F23F}"
+KSCATEGORY_TOPOLOGY       = "{DDA54A40-1E4C-11D1-A050-405705C10000}"
+
