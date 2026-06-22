@@ -22,6 +22,10 @@ VOID
 ViosndPollEvents(
     _Inout_ PVIOSND_DEVICE Device);
 
+VOID
+ViosndKickTxQueue(
+    _Inout_ PVIOSND_DEVICE Device);
+
 NTSTATUS
 ViosndQueryPcmStreams(
     _Inout_ PVIOSND_DEVICE Device,
@@ -29,6 +33,11 @@ ViosndQueryPcmStreams(
 
 NTSTATUS
 ViosndConfigureDefaultPcm(
+    _Inout_ PVIOSND_DEVICE Device,
+    _In_ ULONG StreamId);
+
+NTSTATUS
+ViosndConfigureFallbackPcm(
     _Inout_ PVIOSND_DEVICE Device,
     _In_ ULONG StreamId);
 
@@ -64,20 +73,24 @@ ViosndSubmitWritePcm(
 
 NTSTATUS
 ViosndAllocateWritePcmIo(
+    _Inout_ PVIOSND_DEVICE Device,
     _In_ ULONG MaxAudioLength,
     _Outptr_ PVIOSND_PCM_IO *Io);
 
 VOID
 ViosndFreeWritePcmIo(
+    _Inout_ PVIOSND_DEVICE Device,
     _In_opt_ PVIOSND_PCM_IO Io);
 
 NTSTATUS
 ViosndAllocateReadPcmIo(
+    _Inout_ PVIOSND_DEVICE Device,
     _In_ ULONG MaxAudioLength,
     _Outptr_ PVIOSND_PCM_IO *Io);
 
 VOID
 ViosndFreeReadPcmIo(
+    _Inout_ PVIOSND_DEVICE Device,
     _In_opt_ PVIOSND_PCM_IO Io);
 
 NTSTATUS
@@ -86,6 +99,8 @@ ViosndSubmitPreparedWritePcm(
     _In_ ULONG StreamId,
     _In_reads_bytes_(Length) const VOID *Buffer,
     _In_ ULONG Length,
+    _In_ ULONG SourceLength,
+    _In_ ULONG PacketNumber,
     _Inout_ PVIOSND_PCM_IO Io);
 
 NTSTATUS
@@ -99,6 +114,11 @@ ViosndReclaimPreparedWritePcm(
     _Outptr_opt_result_maybenull_ PVIOSND_PCM_IO *Io,
     _Out_opt_ PULONG BytesWritten,
     _Out_opt_ PULONG LatencyBytes);
+
+NTSTATUS
+ViosndDetachUnusedWritePcm(
+    _Inout_ PVIOSND_DEVICE Device,
+    _Outptr_opt_result_maybenull_ PVIOSND_PCM_IO *Io);
 
 NTSTATUS
 ViosndSubmitPreparedReadPcm(
@@ -125,6 +145,10 @@ ViosndGetPcmIoAudioBuffer(
 
 ULONG
 ViosndGetPcmIoPacketNumber(
+    _In_ PVIOSND_PCM_IO Io);
+
+ULONG
+ViosndGetPcmIoSourceLength(
     _In_ PVIOSND_PCM_IO Io);
 
 NTSTATUS

@@ -3,6 +3,21 @@
 static const u64 ViosndDefaultFormatMask = (1ULL << VIRTIO_SND_PCM_FMT_S16);
 static const u64 ViosndDefaultRateMask = (1ULL << VIRTIO_SND_PCM_RATE_48000);
 
+static UCHAR
+ViosndPcmRateFromSampleRate(
+    _In_ ULONG SampleRate)
+{
+    switch (SampleRate) {
+    case 16000:
+        return VIRTIO_SND_PCM_RATE_16000;
+    case 44100:
+        return VIRTIO_SND_PCM_RATE_44100;
+    case 48000:
+    default:
+        return VIRTIO_SND_PCM_RATE_48000;
+    }
+}
+
 VOID
 ViosndGetDefaultPcmFormat(
     _Out_ PVIOSND_PCM_FORMAT Format)
@@ -13,6 +28,16 @@ ViosndGetDefaultPcmFormat(
     Format->BitsPerSample = VIOSND_DEFAULT_BITS_PER_SAMPLE;
     Format->BufferBytes = VIOSND_DEFAULT_BUFFER_BYTES;
     Format->PeriodBytes = VIOSND_DEFAULT_PERIOD_BYTES;
+}
+
+VOID
+ViosndGetFallbackPcmFormat(
+    _Out_ PVIOSND_PCM_FORMAT Format)
+{
+    ViosndGetDefaultPcmFormat(Format);
+    Format->SampleRate = VIOSND_FALLBACK_SAMPLE_RATE;
+    Format->PeriodBytes = VIOSND_FALLBACK_PERIOD_BYTES;
+    Format->BufferBytes = VIOSND_FALLBACK_PERIOD_BYTES * 16u;
 }
 
 BOOLEAN
@@ -49,7 +74,7 @@ ViosndBuildSetParams(
     Params->features = 0;
     Params->channels = Format->Channels;
     Params->format = VIRTIO_SND_PCM_FMT_S16;
-    Params->rate = VIRTIO_SND_PCM_RATE_48000;
+    Params->rate = ViosndPcmRateFromSampleRate(Format->SampleRate);
 }
 
 NTSTATUS

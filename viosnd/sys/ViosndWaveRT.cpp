@@ -6,19 +6,25 @@ enum {
 
 #define VIOSND_RENDER_IO_POOL_SIZE 12u
 #define VIOSND_RENDER_TARGET_OUTSTANDING_PACKETS 8u
-#define VIOSND_RENDER_CYCLIC_OUTSTANDING_PACKETS 8u
-#define VIOSND_RENDER_CYCLIC_PREROLL_PACKETS VIOSND_RENDER_CYCLIC_OUTSTANDING_PACKETS
+#define VIOSND_RENDER_CYCLIC_OUTSTANDING_PACKETS 2u
+#define VIOSND_RENDER_FALLBACK_OUTSTANDING_PACKETS 2u
+#define VIOSND_RENDER_START_PREROLL_PACKETS 2u
+#define VIOSND_RENDER_CYCLIC_PREROLL_PACKETS VIOSND_RENDER_START_PREROLL_PACKETS
 #define VIOSND_CAPTURE_IO_POOL_SIZE 8u
 #define VIOSND_CAPTURE_TARGET_OUTSTANDING_PACKETS 4u
-#define VIOSND_COMPLETION_STALL_LOG_LOOPS 200u
+#define VIOSND_COMPLETION_STALL_LOG_LOOPS 50u
+#define VIOSND_RENDER_REKICK_STALL_LOOPS 5u
 #define VIOSND_RENDER_POLL_INTERVAL_US 1000LL
 #define VIOSND_CAPTURE_POLL_INTERVAL_US 1000LL
 #define VIOSND_CAPTURE_STOP_RECLAIM_POLLS 2u
 #define VIOSND_CAPTURE_STOP_TIMEOUT_MS 50LL
+#define VIOSND_RENDER_STOP_TIMEOUT_MS 250LL
 #define VIOSND_CAPTURE_SOFTWARE_GAIN 1
 #define VIOSND_CAPTURE_NOISE_GATE_PEAK 0u
 #define VIOSND_PERIODIC_LOG_MASK 0x1ffu
 #define VIOSND_RENDER_SOFTWARE_CLOCK 1
+#define VIOSND_FALLBACK_MONITOR_MS 2000LL
+#define VIOSND_FALLBACK_TRIGGER_PERCENT 65u
 
 static volatile LONG ViosndCaptureFaulted;
 static UCHAR ViosndSilencePeriod[VIOSND_DEFAULT_PERIOD_BYTES];
@@ -290,6 +296,27 @@ ViosndCyclicTargetOutstandingPackets(
     return min(NotificationCount - 1, VIOSND_RENDER_CYCLIC_OUTSTANDING_PACKETS);
 }
 
+static ULONG
+ViosndFallbackTargetOutstandingPackets(
+    _In_ ULONG NotificationCount)
+{
+    if (NotificationCount == 0) {
+        return 0;
+    }
+
+    if (NotificationCount == 1) {
+        return 1;
+    }
+
+    return min(NotificationCount - 1, VIOSND_RENDER_FALLBACK_OUTSTANDING_PACKETS);
+}
+
+static ULONG
+ViosndFallbackInitialPhase()
+{
+    return VIOSND_DEFAULT_SAMPLE_RATE - VIOSND_FALLBACK_SAMPLE_RATE;
+}
+
 static BOOLEAN
 ViosndPacketNumberLessOrEqual(
     _In_ ULONG Left,
@@ -423,6 +450,43 @@ ViosndPcmCopyGain16(
     return peak;
 }
 
+static ULONG
+ViosndDownsampleStereo16(
+    _Out_writes_bytes_(DestinationLength) VOID *Destination,
+    _In_ ULONG DestinationLength,
+    _In_reads_bytes_(SourceLength) const VOID *Source,
+    _In_ ULONG SourceLength,
+    _In_ ULONG DestinationSampleRate,
+    _Inout_ PULONG Phase)
+{
+    SHORT *destination = (SHORT *)Destination;
+    const SHORT *source = (const SHORT *)Source;
+    ULONG sourceFrames = SourceLength /
+                         (VIOSND_DEFAULT_CHANNELS * sizeof(SHORT));
+    ULONG maxDestinationFrames = DestinationLength /
+                                 (VIOSND_DEFAULT_CHANNELS * sizeof(SHORT));
+    ULONG outputFrames = 0;
+    ULONG phase = *Phase;
+
+    if (DestinationSampleRate == 0 ||
+        DestinationSampleRate >= VIOSND_DEFAULT_SAMPLE_RATE) {
+        return 0;
+    }
+
+    for (ULONG frame = 0; frame < sourceFrames && outputFrames < maxDestinationFrames; ++frame) {
+        phase += DestinationSampleRate;
+        if (phase >= VIOSND_DEFAULT_SAMPLE_RATE) {
+            phase -= VIOSND_DEFAULT_SAMPLE_RATE;
+            destination[(outputFrames * 2u)] = source[(frame * 2u)];
+            destination[(outputFrames * 2u) + 1u] = source[(frame * 2u) + 1u];
+            outputFrames++;
+        }
+    }
+
+    *Phase = phase;
+    return outputFrames * VIOSND_DEFAULT_CHANNELS * sizeof(SHORT);
+}
+
 static VOID
 ViosndRenderThread(_In_ PVOID Context);
 
@@ -477,10 +541,14 @@ private:
     ULONG m_CaptureOverflows;
     ULONG m_RenderStallLoops;
     ULONG m_CaptureStallLoops;
+    ULONG m_RenderPositionQueries;
     ULONG m_CapturePositionQueries;
     ULONG m_CaptureReadPackets;
+    ULONG m_RenderFallbackPhase;
     PVIOSND_PCM_IO m_RenderIoPool[VIOSND_RENDER_IO_POOL_SIZE];
     ULONG m_RenderIoFreeCount;
+    PVOID m_RenderFallbackBuffer;
+    ULONG m_RenderFallbackBufferSize;
     PVIOSND_PCM_IO m_CaptureIoPool[VIOSND_CAPTURE_IO_POOL_SIZE];
     ULONG m_CaptureIoFreeCount;
     ULONGLONG m_Position;
@@ -488,15 +556,20 @@ private:
     LONGLONG m_RunStartQpc;
     LONGLONG m_QpcFrequency;
     ULONG m_RenderNotReadyLoops;
+    ULONGLONG m_FallbackMonitorStartPosition;
+    LONGLONG m_FallbackMonitorStartQpc;
     PKEVENT m_NotificationEvent;
     KEVENT m_StopEvent;
     KEVENT m_KickEvent;
     PVOID m_ThreadObject;
     BOOLEAN m_WorkerStarted;
+    BOOLEAN m_RenderFallbackActive;
+    BOOLEAN m_RenderFallbackAttempted;
 
     NTSTATUS SubmitRenderPacket(_In_ ULONG PacketNumber, _In_ ULONG PacketLength);
     NTSTATUS SubmitRenderSilencePacket(_In_ ULONG PacketNumber);
     VOID ReclaimRenderPackets(_Inout_ PULONG SubmittedSinceLog);
+    VOID CancelRenderWrites(_In_ NTSTATUS FailureStatus);
     NTSTATUS AllocateRenderIoPool();
     VOID FreeRenderIoPool();
     NTSTATUS AllocateCaptureIoPool();
@@ -506,6 +579,8 @@ private:
     NTSTATUS StartRenderWorker();
     BOOLEAN StopRenderWorker();
     ULONGLONG GetRenderClockPosition();
+    VOID MaybeSwitchRenderFallback();
+    NTSTATUS SwitchRenderToFallback();
     VOID RenderWorkerLoop();
     VOID CaptureWorkerLoop();
 };
@@ -561,18 +636,26 @@ CViosndMiniportWaveRTStream::CViosndMiniportWaveRTStream(
     m_CaptureOverflows(0),
     m_RenderStallLoops(0),
     m_CaptureStallLoops(0),
+    m_RenderPositionQueries(0),
     m_CapturePositionQueries(0),
     m_CaptureReadPackets(0),
+    m_RenderFallbackPhase(0),
     m_RenderIoFreeCount(0),
+    m_RenderFallbackBuffer(NULL),
+    m_RenderFallbackBufferSize(0),
     m_CaptureIoFreeCount(0),
     m_Position(0),
     m_RunStartPosition(0),
     m_RunStartQpc(0),
     m_QpcFrequency(0),
     m_RenderNotReadyLoops(0),
+    m_FallbackMonitorStartPosition(0),
+    m_FallbackMonitorStartQpc(0),
     m_NotificationEvent(NULL),
     m_ThreadObject(NULL),
-    m_WorkerStarted(FALSE)
+    m_WorkerStarted(FALSE),
+    m_RenderFallbackActive(FALSE),
+    m_RenderFallbackAttempted(FALSE)
 {
     KeInitializeEvent(&m_StopEvent, NotificationEvent, FALSE);
     KeInitializeEvent(&m_KickEvent, SynchronizationEvent, FALSE);
@@ -657,6 +740,10 @@ CViosndMiniportWaveRTStream::SubmitRenderPacket(
     ULONG offset;
     ULONG length;
     PUCHAR packet;
+    const VOID *submitPacket;
+    ULONG submitLength;
+    ULONG sourceLength;
+    ULONG sourcePackets;
     NTSTATUS status;
     PVIOSND_PCM_IO io;
 
@@ -670,34 +757,112 @@ CViosndMiniportWaveRTStream::SubmitRenderPacket(
     length = min(PacketLength, m_PacketSize);
     offset = (PacketNumber % max(m_NotificationCount, 1u)) * m_PacketSize;
     packet = (PUCHAR)m_Buffer + offset;
+    KeMemoryBarrier();
     if (PacketLength < m_PacketSize) {
         RtlZeroMemory(packet + length, m_PacketSize - length);
         length = m_PacketSize;
+    }
+    submitPacket = packet;
+    submitLength = length;
+    sourceLength = length;
+    sourcePackets = 1;
+
+    if (m_RenderFallbackActive) {
+        ULONG fallbackPhase = m_RenderFallbackPhase;
+
+        if (m_RenderFallbackBuffer == NULL ||
+            m_RenderFallbackBufferSize < VIOSND_FALLBACK_PERIOD_BYTES) {
+            return STATUS_DEVICE_NOT_READY;
+        }
+        submitLength = 0;
+        sourceLength = 0;
+        sourcePackets = 0;
+        for (ULONG i = 0; i < 3u && submitLength < VIOSND_FALLBACK_PERIOD_BYTES; ++i) {
+            ULONG sourcePacket = PacketNumber + i;
+            ULONG sourceOffset;
+            PUCHAR source;
+            ULONG sourcePacketLength = m_PacketSize;
+            ULONG downsampled;
+
+            if (m_LastOsWritePacket != MAXULONG &&
+                !ViosndPacketNumberLessOrEqual(sourcePacket, m_LastOsWritePacket)) {
+                break;
+            }
+
+            if (m_EosPacketNumber == sourcePacket) {
+                sourcePacketLength = m_EosPacketLength;
+            }
+
+            sourceOffset = (sourcePacket % max(m_NotificationCount, 1u)) * m_PacketSize;
+            source = (PUCHAR)m_Buffer + sourceOffset;
+            downsampled = ViosndDownsampleStereo16((PUCHAR)m_RenderFallbackBuffer + submitLength,
+                                                   VIOSND_FALLBACK_PERIOD_BYTES - submitLength,
+                                                   source,
+                                                   sourcePacketLength,
+                                                   VIOSND_FALLBACK_SAMPLE_RATE,
+                                                   &fallbackPhase);
+            submitLength += downsampled;
+            sourceLength += sourcePacketLength;
+            sourcePackets++;
+
+            if (m_EosPacketNumber == sourcePacket) {
+                break;
+            }
+        }
+        submitPacket = m_RenderFallbackBuffer;
+        if (submitLength == 0) {
+            return STATUS_INVALID_BUFFER_SIZE;
+        }
+        m_RenderFallbackPhase = fallbackPhase;
     }
 
     io = m_RenderIoPool[--m_RenderIoFreeCount];
     m_RenderIoPool[m_RenderIoFreeCount] = NULL;
 
+    if ((PacketNumber & VIOSND_PERIODIC_LOG_MASK) == 0 ||
+        PacketLength < m_PacketSize) {
+        VIOSND_LOG(DPFLTR_IHVDRIVER_ID,
+                   DPFLTR_ERROR_LEVEL,
+                   "viosnd: stream %u render submit begin packet=%u length=%u requested=%u offset=%u outstanding=%u free=%u last=%u\n",
+                   m_StreamId,
+                   PacketNumber,
+                   submitLength,
+                   PacketLength,
+                   offset,
+                   m_OutstandingWrites,
+                   m_RenderIoFreeCount,
+                   m_LastOsWritePacket);
+    }
+
     status = ViosndSubmitPreparedWritePcm(m_Device,
                                           m_StreamId,
-                                          packet,
-                                          length,
+                                          submitPacket,
+                                          submitLength,
+                                          sourceLength,
+                                          PacketNumber,
                                           io);
     if (NT_SUCCESS(status)) {
-        m_NextSubmitPacket = PacketNumber + 1;
+        m_NextSubmitPacket = PacketNumber + sourcePackets;
         m_OutstandingWrites++;
-        if ((PacketNumber & VIOSND_PERIODIC_LOG_MASK) == 0 || PacketLength < m_PacketSize) {
+        if ((PacketNumber & VIOSND_PERIODIC_LOG_MASK) == 0 ||
+            PacketLength < m_PacketSize) {
+            ULONG peak = ViosndPcmPeak16(submitPacket, submitLength);
             VIOSND_LOG(DPFLTR_IHVDRIVER_ID,
                        DPFLTR_ERROR_LEVEL,
-                       "viosnd: stream %u render submit packet=%u length=%u requested=%u outstanding=%u last=%u eos=%u/%u\n",
+                       "viosnd: stream %u render submit packet=%u length=%u source=%u packets=%u requested=%u peak=%u offset=%u outstanding=%u last=%u eos=%u/%u fallback=%u\n",
                        m_StreamId,
                        PacketNumber,
-                       length,
+                       submitLength,
+                       sourceLength,
+                       sourcePackets,
                        PacketLength,
+                       peak,
+                       offset,
                        m_OutstandingWrites,
                        m_LastOsWritePacket,
                        m_EosPacketNumber,
-                       m_EosPacketLength);
+                       m_EosPacketLength,
+                       m_RenderFallbackActive);
         }
     } else {
         VIOSND_LOG(DPFLTR_IHVDRIVER_ID,
@@ -705,7 +870,7 @@ CViosndMiniportWaveRTStream::SubmitRenderPacket(
                    "viosnd: stream %u submit render packet=%u length=%u failed 0x%08x\n",
                    m_StreamId,
                    PacketNumber,
-                   length,
+                   submitLength,
                    status);
         m_RenderIoPool[m_RenderIoFreeCount++] = io;
     }
@@ -719,6 +884,7 @@ CViosndMiniportWaveRTStream::SubmitRenderSilencePacket(
 {
     NTSTATUS status;
     PVIOSND_PCM_IO io;
+    ULONG silenceLength;
 
     if (m_Capture || m_Buffer == NULL || m_PacketSize == 0) {
         return STATUS_INVALID_DEVICE_REQUEST;
@@ -726,7 +892,8 @@ CViosndMiniportWaveRTStream::SubmitRenderSilencePacket(
     if (m_RenderIoFreeCount == 0) {
         return STATUS_DEVICE_BUSY;
     }
-    if (m_PacketSize > sizeof(ViosndSilencePeriod)) {
+    silenceLength = m_RenderFallbackActive ? VIOSND_FALLBACK_PERIOD_BYTES : m_PacketSize;
+    if (silenceLength > sizeof(ViosndSilencePeriod)) {
         return STATUS_INVALID_BUFFER_SIZE;
     }
 
@@ -736,10 +903,14 @@ CViosndMiniportWaveRTStream::SubmitRenderSilencePacket(
     status = ViosndSubmitPreparedWritePcm(m_Device,
                                           m_StreamId,
                                           ViosndSilencePeriod,
-                                          m_PacketSize,
+                                          silenceLength,
+                                          silenceLength,
+                                          PacketNumber,
                                           io);
     if (NT_SUCCESS(status)) {
-        m_NextSubmitPacket = PacketNumber + 1;
+        if (PacketNumber != MAXULONG) {
+            m_NextSubmitPacket = PacketNumber + 1;
+        }
         m_OutstandingWrites++;
         if ((PacketNumber & VIOSND_PERIODIC_LOG_MASK) == 0) {
             VIOSND_LOG(DPFLTR_IHVDRIVER_ID,
@@ -772,30 +943,65 @@ CViosndMiniportWaveRTStream::ReclaimRenderPackets(_Inout_ PULONG SubmittedSinceL
             return;
         }
 
+        if (io == NULL) {
+            VIOSND_LOG(DPFLTR_IHVDRIVER_ID,
+                       DPFLTR_ERROR_LEVEL,
+                       "viosnd: stream %u reclaim render returned 0x%08x without io outstanding=%u next=%u\n",
+                       m_StreamId,
+                       status,
+                       m_OutstandingWrites,
+                       m_NextSubmitPacket);
+            return;
+        }
+
         if (m_OutstandingWrites != 0) {
             m_OutstandingWrites--;
         }
 
         if (NT_SUCCESS(status)) {
-            m_Position += bytesWritten;
-            m_PacketNumber++;
-            (*SubmittedSinceLog)++;
-            if ((m_PacketNumber & VIOSND_PERIODIC_LOG_MASK) == 0 ||
-                latencyBytes > m_PacketSize * 4) {
+            ULONG packetNumber = ViosndGetPcmIoPacketNumber(io);
+
+            if (packetNumber == MAXULONG) {
                 VIOSND_LOG(DPFLTR_IHVDRIVER_ID,
                            DPFLTR_ERROR_LEVEL,
-                           "viosnd: stream %u render reclaim packet=%u bytes=%u pos=%llu latency=%u outstanding=%u next=%u last=%u\n",
+                           "viosnd: stream %u render reclaim preroll bytes=%u pos=%llu latency=%u outstanding=%u next=%u last=%u\n",
                            m_StreamId,
-                           m_PacketNumber,
                            bytesWritten,
                            m_Position,
                            latencyBytes,
                            m_OutstandingWrites,
                            m_NextSubmitPacket,
                            m_LastOsWritePacket);
-            }
-            if (m_NotificationEvent != NULL) {
-                KeSetEvent(m_NotificationEvent, IO_NO_INCREMENT, FALSE);
+            } else {
+                ULONG sourceBytes = m_RenderFallbackActive ?
+                                        ViosndGetPcmIoSourceLength(io) :
+                                        bytesWritten;
+
+                if (sourceBytes == 0) {
+                    sourceBytes = bytesWritten;
+                }
+                m_Position += sourceBytes;
+                m_PacketNumber++;
+                (*SubmittedSinceLog)++;
+                if ((m_PacketNumber & VIOSND_PERIODIC_LOG_MASK) == 0 ||
+                    latencyBytes > m_PacketSize * 4) {
+                    VIOSND_LOG(DPFLTR_IHVDRIVER_ID,
+                               DPFLTR_ERROR_LEVEL,
+                               "viosnd: stream %u render reclaim packet=%u bytes=%u source=%u pos=%llu latency=%u outstanding=%u next=%u last=%u fallback=%u\n",
+                               m_StreamId,
+                               m_PacketNumber,
+                               bytesWritten,
+                               sourceBytes,
+                               m_Position,
+                               latencyBytes,
+                               m_OutstandingWrites,
+                               m_NextSubmitPacket,
+                               m_LastOsWritePacket,
+                               m_RenderFallbackActive);
+                }
+                if (m_NotificationEvent != NULL) {
+                    KeSetEvent(m_NotificationEvent, IO_NO_INCREMENT, FALSE);
+                }
             }
         } else {
             VIOSND_LOG(DPFLTR_IHVDRIVER_ID,
@@ -809,8 +1015,53 @@ CViosndMiniportWaveRTStream::ReclaimRenderPackets(_Inout_ PULONG SubmittedSinceL
         if (io != NULL && m_RenderIoFreeCount < VIOSND_RENDER_IO_POOL_SIZE) {
             m_RenderIoPool[m_RenderIoFreeCount++] = io;
         } else {
-            ViosndFreeWritePcmIo(io);
+        ViosndFreeWritePcmIo(m_Device, io);
         }
+    }
+}
+
+VOID
+CViosndMiniportWaveRTStream::CancelRenderWrites(_In_ NTSTATUS FailureStatus)
+{
+    ULONG reclaimed = 0;
+    ULONG detached = 0;
+
+    if (m_Capture) {
+        return;
+    }
+
+    ReclaimRenderPackets(&reclaimed);
+
+    while (m_OutstandingWrites != 0) {
+        PVIOSND_PCM_IO io = NULL;
+        NTSTATUS status = ViosndDetachUnusedWritePcm(m_Device, &io);
+
+        if (!NT_SUCCESS(status)) {
+            break;
+        }
+
+        if (m_OutstandingWrites != 0) {
+            m_OutstandingWrites--;
+        }
+        detached++;
+
+        if (io != NULL && m_RenderIoFreeCount < VIOSND_RENDER_IO_POOL_SIZE) {
+            m_RenderIoPool[m_RenderIoFreeCount++] = io;
+        } else {
+            ViosndFreeWritePcmIo(m_Device, io);
+        }
+    }
+
+    if (reclaimed != 0 || detached != 0 || m_OutstandingWrites != 0) {
+        VIOSND_LOG(DPFLTR_IHVDRIVER_ID,
+                   DPFLTR_ERROR_LEVEL,
+                   "viosnd: stream %u render startup cleanup failure=0x%08x reclaimed=%u detached=%u outstanding=%u free=%u\n",
+                   m_StreamId,
+                   FailureStatus,
+                   reclaimed,
+                   detached,
+                   m_OutstandingWrites,
+                   m_RenderIoFreeCount);
     }
 }
 
@@ -825,9 +1076,23 @@ CViosndMiniportWaveRTStream::AllocateRenderIoPool()
         return STATUS_DEVICE_NOT_READY;
     }
 
+    if (m_RenderFallbackBuffer == NULL) {
+        m_RenderFallbackBufferSize = max(VIOSND_FALLBACK_PERIOD_BYTES, m_PacketSize);
+        m_RenderFallbackBuffer = ExAllocatePoolUninitialized(NonPagedPoolNx,
+                                                             m_RenderFallbackBufferSize,
+                                                             VIOSND_POOL_TAG);
+        if (m_RenderFallbackBuffer == NULL) {
+            m_RenderFallbackBufferSize = 0;
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+    }
+
     for (ULONG i = 0; i < VIOSND_RENDER_IO_POOL_SIZE; ++i) {
         PVIOSND_PCM_IO io = NULL;
-        NTSTATUS status = ViosndAllocateWritePcmIo(m_PacketSize, &io);
+        NTSTATUS status = ViosndAllocateWritePcmIo(m_Device,
+                                                   max(m_PacketSize,
+                                                       VIOSND_FALLBACK_PERIOD_BYTES),
+                                                   &io);
 
         if (!NT_SUCCESS(status)) {
             FreeRenderIoPool();
@@ -860,7 +1125,13 @@ CViosndMiniportWaveRTStream::FreeRenderIoPool()
         PVIOSND_PCM_IO io = m_RenderIoPool[--m_RenderIoFreeCount];
 
         m_RenderIoPool[m_RenderIoFreeCount] = NULL;
-        ViosndFreeWritePcmIo(io);
+            ViosndFreeWritePcmIo(m_Device, io);
+    }
+
+    if (m_RenderFallbackBuffer != NULL) {
+        ExFreePoolWithTag(m_RenderFallbackBuffer, VIOSND_POOL_TAG);
+        m_RenderFallbackBuffer = NULL;
+        m_RenderFallbackBufferSize = 0;
     }
 }
 
@@ -877,7 +1148,7 @@ CViosndMiniportWaveRTStream::AllocateCaptureIoPool()
 
     for (ULONG i = 0; i < VIOSND_CAPTURE_IO_POOL_SIZE; ++i) {
         PVIOSND_PCM_IO io = NULL;
-        NTSTATUS status = ViosndAllocateReadPcmIo(m_PacketSize, &io);
+        NTSTATUS status = ViosndAllocateReadPcmIo(m_Device, m_PacketSize, &io);
 
         if (!NT_SUCCESS(status)) {
             FreeCaptureIoPool();
@@ -915,7 +1186,7 @@ CViosndMiniportWaveRTStream::FreeCaptureIoPool()
         PVIOSND_PCM_IO io = m_CaptureIoPool[--m_CaptureIoFreeCount];
 
         m_CaptureIoPool[m_CaptureIoFreeCount] = NULL;
-        ViosndFreeReadPcmIo(io);
+        ViosndFreeReadPcmIo(m_Device, io);
     }
 }
 
@@ -1053,7 +1324,7 @@ CViosndMiniportWaveRTStream::ReclaimCapturePackets()
         if (io != NULL && m_CaptureIoFreeCount < VIOSND_CAPTURE_IO_POOL_SIZE) {
             m_CaptureIoPool[m_CaptureIoFreeCount++] = io;
         } else {
-            ViosndFreeReadPcmIo(io);
+            ViosndFreeReadPcmIo(m_Device, io);
         }
     }
 }
@@ -1126,24 +1397,28 @@ CViosndMiniportWaveRTStream::StopRenderWorker()
                m_LastOsWritePacket);
     KeSetEvent(&m_StopEvent, IO_NO_INCREMENT, FALSE);
 
-    timeout.QuadPart = -(10LL * 1000LL * VIOSND_CAPTURE_STOP_TIMEOUT_MS);
+    timeout.QuadPart = -(10LL * 1000LL *
+                         (m_Capture ? VIOSND_CAPTURE_STOP_TIMEOUT_MS : VIOSND_RENDER_STOP_TIMEOUT_MS));
     waitStatus = KeWaitForSingleObject(threadObject,
                                        Executive,
                                        KernelMode,
                                        FALSE,
-                                       m_Capture ? &timeout : NULL);
+                                       &timeout);
     if (waitStatus == STATUS_TIMEOUT) {
         VIOSND_LOG(DPFLTR_IHVDRIVER_ID,
                    DPFLTR_ERROR_LEVEL,
-                   "viosnd: stream %u capture stop worker timeout; capture disabled outstanding=%u next=%u inFlight=%u\n",
+                   "viosnd: stream %u %s stop worker timeout outstanding=%u next=%u inFlight=%u\n",
                    m_StreamId,
+                   m_Capture ? "capture" : "render",
                    m_OutstandingWrites,
                    m_NextSubmitPacket,
                    m_CaptureInFlight);
-        InterlockedExchange((volatile LONG *)&ViosndCaptureFaulted, 1);
-        ObDereferenceObject(threadObject);
-        m_ThreadObject = NULL;
-        m_WorkerStarted = FALSE;
+        if (m_Capture) {
+            InterlockedExchange((volatile LONG *)&ViosndCaptureFaulted, 1);
+            ObDereferenceObject(threadObject);
+            m_ThreadObject = NULL;
+            m_WorkerStarted = FALSE;
+        }
         return FALSE;
     }
 
@@ -1184,6 +1459,158 @@ CViosndMiniportWaveRTStream::GetRenderClockPosition()
 }
 
 VOID
+CViosndMiniportWaveRTStream::MaybeSwitchRenderFallback()
+{
+    LARGE_INTEGER qpc;
+    LONGLONG elapsedQpc;
+    ULONGLONG elapsedMs;
+    ULONGLONG completedBytes;
+    ULONGLONG expectedBytes;
+    const ULONGLONG bytesPerSecond =
+        (ULONGLONG)VIOSND_DEFAULT_SAMPLE_RATE *
+        VIOSND_DEFAULT_CHANNELS *
+        (VIOSND_DEFAULT_BITS_PER_SAMPLE / 8u);
+
+    if (m_Capture ||
+        m_RenderFallbackAttempted ||
+        m_State != KSSTATE_RUN ||
+        m_QpcFrequency <= 0) {
+        return;
+    }
+
+    qpc = KeQueryPerformanceCounter(NULL);
+    if (m_FallbackMonitorStartQpc == 0) {
+        m_FallbackMonitorStartQpc = qpc.QuadPart;
+        m_FallbackMonitorStartPosition = m_Position;
+        return;
+    }
+
+    elapsedQpc = qpc.QuadPart - m_FallbackMonitorStartQpc;
+    if (elapsedQpc <= 0) {
+        return;
+    }
+
+    elapsedMs = ((ULONGLONG)elapsedQpc * 1000u) / (ULONGLONG)m_QpcFrequency;
+    if (elapsedMs < VIOSND_FALLBACK_MONITOR_MS) {
+        return;
+    }
+
+    completedBytes = m_Position - m_FallbackMonitorStartPosition;
+    expectedBytes = ((ULONGLONG)elapsedQpc * bytesPerSecond) /
+                    (ULONGLONG)m_QpcFrequency;
+    if (expectedBytes == 0) {
+        return;
+    }
+
+    if ((completedBytes * 100u) >=
+        (expectedBytes * VIOSND_FALLBACK_TRIGGER_PERCENT)) {
+        if (!m_RenderFallbackActive) {
+            m_RenderFallbackAttempted = TRUE;
+            VIOSND_LOG(DPFLTR_IHVDRIVER_ID,
+                       DPFLTR_ERROR_LEVEL,
+                       "viosnd: stream %u render fallback not needed completed=%llu expected=%llu percent=%llu\n",
+                       m_StreamId,
+                       completedBytes,
+                       expectedBytes,
+                       (completedBytes * 100u) / expectedBytes);
+        } else {
+            VIOSND_LOG(DPFLTR_IHVDRIVER_ID,
+                       DPFLTR_ERROR_LEVEL,
+                       "viosnd: stream %u render fallback stable rate=%u completed=%llu expected=%llu percent=%llu\n",
+                       m_StreamId,
+                       VIOSND_FALLBACK_SAMPLE_RATE,
+                       completedBytes,
+                       expectedBytes,
+                       (completedBytes * 100u) / expectedBytes);
+            m_FallbackMonitorStartQpc = qpc.QuadPart;
+            m_FallbackMonitorStartPosition = m_Position;
+        }
+        return;
+    }
+
+    (VOID)SwitchRenderToFallback();
+}
+
+NTSTATUS
+CViosndMiniportWaveRTStream::SwitchRenderToFallback()
+{
+    NTSTATUS stopStatus;
+    NTSTATUS releaseStatus;
+    NTSTATUS status;
+    LARGE_INTEGER frequency;
+    LARGE_INTEGER qpc;
+
+    m_RenderFallbackAttempted = TRUE;
+    VIOSND_LOG(DPFLTR_IHVDRIVER_ID,
+               DPFLTR_ERROR_LEVEL,
+               "viosnd: stream %u render fallback begin rate=%u pos=%llu next=%u outstanding=%u packet=%u\n",
+               m_StreamId,
+               VIOSND_FALLBACK_SAMPLE_RATE,
+               m_Position,
+               m_NextSubmitPacket,
+               m_OutstandingWrites,
+               m_PacketNumber);
+
+    stopStatus = ViosndStopPcm(m_Device, m_StreamId);
+    releaseStatus = ViosndReleasePcm(m_Device, m_StreamId);
+    CancelRenderWrites(!NT_SUCCESS(stopStatus) ? stopStatus : releaseStatus);
+    if (!NT_SUCCESS(stopStatus) || !NT_SUCCESS(releaseStatus)) {
+        VIOSND_LOG(DPFLTR_IHVDRIVER_ID,
+                   DPFLTR_ERROR_LEVEL,
+                   "viosnd: stream %u render fallback stop/release failed stop=0x%08x release=0x%08x outstanding=%u\n",
+                   m_StreamId,
+                   stopStatus,
+                   releaseStatus,
+                   m_OutstandingWrites);
+        return !NT_SUCCESS(stopStatus) ? stopStatus : releaseStatus;
+    }
+
+    m_RenderFallbackActive = TRUE;
+    m_RenderFallbackPhase = ViosndFallbackInitialPhase();
+    status = ViosndConfigureFallbackPcm(m_Device, m_StreamId);
+    if (NT_SUCCESS(status)) {
+        ULONG prerollPackets = VIOSND_RENDER_START_PREROLL_PACKETS;
+
+        while (prerollPackets != 0 &&
+               m_OutstandingWrites < VIOSND_RENDER_START_PREROLL_PACKETS) {
+            status = SubmitRenderSilencePacket(MAXULONG);
+            if (!NT_SUCCESS(status)) {
+                break;
+            }
+            prerollPackets--;
+        }
+    }
+    if (NT_SUCCESS(status)) {
+        status = ViosndStartPcm(m_Device, m_StreamId);
+    }
+    if (!NT_SUCCESS(status)) {
+        VIOSND_LOG(DPFLTR_IHVDRIVER_ID,
+                   DPFLTR_ERROR_LEVEL,
+                   "viosnd: stream %u render fallback start failed 0x%08x\n",
+                   m_StreamId,
+                   status);
+        m_RenderFallbackActive = FALSE;
+        return status;
+    }
+
+    qpc = KeQueryPerformanceCounter(&frequency);
+    m_RunStartPosition = m_Position;
+    m_RunStartQpc = qpc.QuadPart;
+    m_QpcFrequency = frequency.QuadPart;
+    m_FallbackMonitorStartQpc = 0;
+    m_FallbackMonitorStartPosition = 0;
+    VIOSND_LOG(DPFLTR_IHVDRIVER_ID,
+               DPFLTR_ERROR_LEVEL,
+               "viosnd: stream %u render fallback active rate=%u pos=%llu next=%u outstanding=%u\n",
+               m_StreamId,
+               VIOSND_FALLBACK_SAMPLE_RATE,
+               m_Position,
+               m_NextSubmitPacket,
+               m_OutstandingWrites);
+    return STATUS_SUCCESS;
+}
+
+VOID
 CViosndMiniportWaveRTStream::RenderWorkerLoop()
 {
     LARGE_INTEGER interval;
@@ -1219,21 +1646,26 @@ CViosndMiniportWaveRTStream::RenderWorkerLoop()
 
         ViosndPollEvents(m_Device);
         ReclaimRenderPackets(&submittedSinceLog);
+        MaybeSwitchRenderFallback();
         if (m_PacketNumber != lastCompletedPackets) {
             lastCompletedPackets = m_PacketNumber;
             m_RenderStallLoops = 0;
         } else if (m_State == KSSTATE_RUN && m_OutstandingWrites != 0) {
             m_RenderStallLoops++;
+            if ((m_RenderStallLoops % VIOSND_RENDER_REKICK_STALL_LOOPS) == 0) {
+                ViosndKickTxQueue(m_Device);
+            }
             if ((m_RenderStallLoops % VIOSND_COMPLETION_STALL_LOG_LOOPS) == 0) {
                 VIOSND_LOG(DPFLTR_IHVDRIVER_ID,
                            DPFLTR_ERROR_LEVEL,
-                           "viosnd: stream %u render no completion loops=%u outstanding=%u next=%u last=%u pos=%llu\n",
+                           "viosnd: stream %u render no completion loops=%u outstanding=%u next=%u last=%u pos=%llu rekick=%u\n",
                            m_StreamId,
                            m_RenderStallLoops,
                            m_OutstandingWrites,
                            m_NextSubmitPacket,
                            m_LastOsWritePacket,
-                           m_Position);
+                           m_Position,
+                           m_RenderStallLoops / 50u);
             }
         }
 
@@ -1246,9 +1678,13 @@ CViosndMiniportWaveRTStream::RenderWorkerLoop()
             continue;
         }
 
-        targetOutstanding = m_LastOsWritePacket == MAXULONG ?
-                                ViosndCyclicTargetOutstandingPackets(m_NotificationCount) :
-                                ViosndTargetOutstandingPackets(m_NotificationCount);
+        if (m_RenderFallbackActive) {
+            targetOutstanding = ViosndFallbackTargetOutstandingPackets(m_NotificationCount);
+        } else {
+            targetOutstanding = m_LastOsWritePacket == MAXULONG ?
+                                    ViosndCyclicTargetOutstandingPackets(m_NotificationCount) :
+                                    ViosndTargetOutstandingPackets(m_NotificationCount);
+        }
         while (m_State == KSSTATE_RUN &&
                m_OutstandingWrites < targetOutstanding) {
             ULONG packetLength = m_PacketSize;
@@ -1303,12 +1739,15 @@ CViosndMiniportWaveRTStream::RenderWorkerLoop()
         }
     }
 
-    while (m_OutstandingWrites != 0) {
-        ReclaimRenderPackets(&submittedSinceLog);
-        if (m_OutstandingWrites == 0) {
-            break;
-        }
-        KeDelayExecutionThread(KernelMode, FALSE, &interval);
+    if (m_OutstandingWrites != 0) {
+        VIOSND_LOG(DPFLTR_IHVDRIVER_ID,
+                   DPFLTR_ERROR_LEVEL,
+                   "viosnd: stream %u render worker exit with pending tx outstanding=%u next=%u last=%u pos=%llu\n",
+                   m_StreamId,
+                   m_OutstandingWrites,
+                   m_NextSubmitPacket,
+                   m_LastOsWritePacket,
+                   m_Position);
     }
 }
 
@@ -1446,20 +1885,59 @@ CViosndMiniportWaveRTStream::SetState(_In_ KSSTATE State)
                                          0;
             m_RenderStallLoops = 0;
             m_RenderNotReadyLoops = 0;
-            qpc = KeQueryPerformanceCounter(&frequency);
-            m_RunStartPosition = m_Position;
-            m_RunStartQpc = qpc.QuadPart;
-            m_QpcFrequency = frequency.QuadPart;
-            status = ViosndStartPcm(m_Device, m_StreamId);
+            m_RenderPositionQueries = 0;
+            m_RenderFallbackPhase = 0;
+            m_RenderFallbackActive = FALSE;
+            m_RenderFallbackAttempted = FALSE;
+            m_FallbackMonitorStartPosition = 0;
+            m_FallbackMonitorStartQpc = 0;
+            m_RunStartPosition = 0;
+            m_RunStartQpc = 0;
+            m_QpcFrequency = 0;
+            status = ViosndConfigureDefaultPcm(m_Device, m_StreamId);
             if (NT_SUCCESS(status)) {
+                status = AllocateRenderIoPool();
+            }
+            if (NT_SUCCESS(status)) {
+                ULONG prerollPackets = VIOSND_RENDER_START_PREROLL_PACKETS;
+
+                while (prerollPackets != 0 &&
+                       m_OutstandingWrites < VIOSND_RENDER_START_PREROLL_PACKETS) {
+                    status = SubmitRenderSilencePacket(MAXULONG);
+                    if (!NT_SUCCESS(status)) {
+                        break;
+                    }
+                    prerollPackets--;
+                }
+                if (NT_SUCCESS(status)) {
+                    m_RenderPrerollPackets = 0;
+                    VIOSND_LOG(DPFLTR_IHVDRIVER_ID,
+                               DPFLTR_ERROR_LEVEL,
+                               "viosnd: stream %u render prequeued silence outstanding=%u next=%u\n",
+                               m_StreamId,
+                               m_OutstandingWrites,
+                               m_NextSubmitPacket);
+                }
+            }
+            if (NT_SUCCESS(status)) {
+                status = ViosndStartPcm(m_Device, m_StreamId);
+            }
+            if (NT_SUCCESS(status)) {
+                qpc = KeQueryPerformanceCounter(&frequency);
+                m_RunStartPosition = m_Position;
+                m_RunStartQpc = qpc.QuadPart;
+                m_QpcFrequency = frequency.QuadPart;
                 m_State = State;
                 status = StartRenderWorker();
                 if (!NT_SUCCESS(status)) {
                     ViosndStopPcm(m_Device, m_StreamId);
+                    ViosndReleasePcm(m_Device, m_StreamId);
                     m_State = oldState;
                 }
             }
             if (!NT_SUCCESS(status)) {
+                CancelRenderWrites(status);
+                FreeRenderIoPool();
                 m_RunStartPosition = 0;
                 m_RunStartQpc = 0;
                 m_QpcFrequency = 0;
@@ -1483,7 +1961,10 @@ CViosndMiniportWaveRTStream::SetState(_In_ KSSTATE State)
             m_CapturePositionQueries = 0;
             m_CaptureReadPackets = 0;
             m_Position = 0;
-            status = ViosndStartPcm(m_Device, m_StreamId);
+            status = ViosndConfigureDefaultPcm(m_Device, m_StreamId);
+            if (NT_SUCCESS(status)) {
+                status = ViosndStartPcm(m_Device, m_StreamId);
+            }
             if (NT_SUCCESS(status)) {
                 m_State = State;
                 status = StartRenderWorker();
@@ -1549,19 +2030,34 @@ CViosndMiniportWaveRTStream::SetState(_In_ KSSTATE State)
                        InterlockedCompareExchange((volatile LONG *)&ViosndCaptureFaulted, 0, 0));
             status = STATUS_SUCCESS;
         } else {
+            NTSTATUS stopStatus;
+            NTSTATUS releaseStatus;
+            BOOLEAN workerStopped = TRUE;
+
             if (m_WorkerStarted) {
-                StopRenderWorker();
+                workerStopped = StopRenderWorker();
             }
             VIOSND_LOG(DPFLTR_IHVDRIVER_ID,
                        DPFLTR_ERROR_LEVEL,
                        "viosnd: stream %u render stop pcm begin\n",
                        m_StreamId);
-            status = ViosndStopPcm(m_Device, m_StreamId);
+            stopStatus = ViosndStopPcm(m_Device, m_StreamId);
+            releaseStatus = ViosndReleasePcm(m_Device, m_StreamId);
+            if (!workerStopped && m_WorkerStarted) {
+                workerStopped = StopRenderWorker();
+            }
+            CancelRenderWrites(!NT_SUCCESS(stopStatus) ? stopStatus : releaseStatus);
+            FreeRenderIoPool();
             VIOSND_LOG(DPFLTR_IHVDRIVER_ID,
                        DPFLTR_ERROR_LEVEL,
-                       "viosnd: stream %u render stop pcm done 0x%08x\n",
+                       "viosnd: stream %u render stop/release done stop=0x%08x release=0x%08x workerStopped=%u outstanding=%u free=%u\n",
                        m_StreamId,
-                       status);
+                       stopStatus,
+                       releaseStatus,
+                       workerStopped,
+                       m_OutstandingWrites,
+                       m_RenderIoFreeCount);
+            status = workerStopped ? STATUS_SUCCESS : STATUS_DEVICE_BUSY;
             if (NT_SUCCESS(status)) {
                 m_Position = GetRenderClockPosition();
                 m_RunStartPosition = 0;
@@ -1584,7 +2080,13 @@ CViosndMiniportWaveRTStream::SetState(_In_ KSSTATE State)
             m_RenderPrerollPackets = 0;
             m_RenderStallLoops = 0;
             m_CaptureStallLoops = 0;
+            m_RenderPositionQueries = 0;
             m_RenderNotReadyLoops = 0;
+            m_RenderFallbackPhase = 0;
+            m_RenderFallbackActive = FALSE;
+            m_RenderFallbackAttempted = FALSE;
+            m_FallbackMonitorStartPosition = 0;
+            m_FallbackMonitorStartQpc = 0;
             m_RunStartPosition = 0;
             m_RunStartQpc = 0;
             m_QpcFrequency = 0;
@@ -1670,12 +2172,36 @@ CViosndMiniportWaveRTStream::GetPosition(_Out_ PKSAUDIO_POSITION Position)
 
     currentPosition = GetRenderClockPosition();
     playOffset = currentPosition % m_BufferSize;
-    targetOutstanding = m_LastOsWritePacket == MAXULONG ?
-                            ViosndCyclicTargetOutstandingPackets(m_NotificationCount) :
-                            ViosndTargetOutstandingPackets(m_NotificationCount);
+    if (m_RenderFallbackActive) {
+        targetOutstanding = ViosndFallbackTargetOutstandingPackets(m_NotificationCount);
+    } else {
+        targetOutstanding = m_LastOsWritePacket == MAXULONG ?
+                                ViosndCyclicTargetOutstandingPackets(m_NotificationCount) :
+                                ViosndTargetOutstandingPackets(m_NotificationCount);
+    }
     writeLead = (ULONGLONG)m_PacketSize * max(targetOutstanding, 1u);
+    if (m_RenderFallbackActive) {
+        writeLead *= 3u;
+    }
     Position->PlayOffset = playOffset;
     Position->WriteOffset = (playOffset + writeLead) % m_BufferSize;
+    m_RenderPositionQueries++;
+    if (m_RenderPositionQueries <= 8 ||
+        (m_RenderPositionQueries & 0x7f) == 0) {
+        VIOSND_LOG(DPFLTR_IHVDRIVER_ID,
+                   DPFLTR_ERROR_LEVEL,
+                   "viosnd: stream %u render GetPosition count=%u play=%llu write=%llu qpcPos=%llu donePos=%llu next=%u outstanding=%u last=%u state=%u\n",
+                   m_StreamId,
+                   m_RenderPositionQueries,
+                   Position->PlayOffset,
+                   Position->WriteOffset,
+                   currentPosition,
+                   m_Position,
+                   m_NextSubmitPacket,
+                   m_OutstandingWrites,
+                   m_LastOsWritePacket,
+                   m_State);
+    }
     return STATUS_SUCCESS;
 }
 
@@ -1762,7 +2288,13 @@ CViosndMiniportWaveRTStream::FreeAudioBuffer(_In_opt_ PMDL AudioBufferMdl, _In_ 
         m_RenderPrerollPackets = 0;
         m_RenderStallLoops = 0;
         m_CaptureStallLoops = 0;
+        m_RenderPositionQueries = 0;
         m_RenderNotReadyLoops = 0;
+        m_RenderFallbackPhase = 0;
+        m_RenderFallbackActive = FALSE;
+        m_RenderFallbackAttempted = FALSE;
+        m_FallbackMonitorStartPosition = 0;
+        m_FallbackMonitorStartQpc = 0;
         if (m_CaptureInFlight == 0) {
             m_CaptureOverflows = 0;
         }

@@ -9,10 +9,19 @@ extern "C" {
 #include <wdmguid.h>
 
 #define VIOSND_MAX_BARS PCI_TYPE0_ADDRESSES
-#define VIOSND_CONTROL_TIMEOUT_MS 1000u
+#define VIOSND_CONTROL_TIMEOUT_MS 5000u
 #define VIOSND_CONTROL_POLL_DELAY_US 1000u
+#define VIOSND_CONTROL_RENOTIFY_US 100000u
+#define VIOSND_CONTROL_STATUS_RETRY_COUNT 4u
+#define VIOSND_CONTROL_STATUS_RETRY_DELAY_MS 5u
+#define VIOSND_PCM_BAD_MSG_RETRY_COUNT 4u
+#define VIOSND_PCM_BAD_MSG_RETRY_DELAY_MS 10u
 #define VIOSND_MAX_PCM_STREAMS 64u
 #define VIOSND_EVENT_BUFFER_COUNT 8u
+#define VIOSND_EVENT_POLL_BUDGET 8u
+#define VIOSND_PCM_INFO_RETRY_COUNT 8u
+#define VIOSND_PCM_INFO_RETRY_DELAY_MS 100u
+#define VIOSND_TX_MUTEX_TIMEOUT_MS 100u
 #define PORT_MASK 0xFFFF
 
 typedef struct _VIOSND_BAR {
@@ -25,6 +34,7 @@ typedef struct _VIOSND_BAR {
 
 typedef struct _VIOSND_DMA_BLOCK {
     PVOID Va;
+    PHYSICAL_ADDRESS LogicalAddress;
     SIZE_T Size;
     SINGLE_LIST_ENTRY Entry;
 } VIOSND_DMA_BLOCK, *PVIOSND_DMA_BLOCK;
@@ -42,6 +52,8 @@ struct _VIOSND_DEVICE {
     PCI_COMMON_HEADER PciHeader;
     VIOSND_BAR Bars[VIOSND_MAX_BARS];
     SINGLE_LIST_ENTRY DmaBlocks;
+    PDMA_ADAPTER DmaAdapter;
+    ULONG DmaMapRegisters;
     VirtIODevice Vdev;
     BOOLEAN VirtioInitialized;
     struct virtqueue *Queues[VIRTIO_SND_VQ_MAX];
@@ -86,6 +98,7 @@ struct _VIOSND_PCM_IO {
     VIRTIO_SND_PCM_STATUS *StatusVa;
     PHYSICAL_ADDRESS StatusPa;
     ULONG AudioLength;
+    ULONG SourceLength;
     ULONG PacketNumber;
     ULONG StreamId;
 };
@@ -157,20 +170,18 @@ ViosndWriteDword(
 }
 
 static void *
-ViosndAllocContiguous(
-    _In_ void *Context,
-    _In_ size_t Size)
+ViosndAllocateDmaBuffer(
+    _Inout_ PVIOSND_DEVICE Device,
+    _In_ size_t Size,
+    _Out_ PPHYSICAL_ADDRESS LogicalAddress)
 {
-    PVIOSND_DEVICE device = (PVIOSND_DEVICE)Context;
-    PHYSICAL_ADDRESS low;
-    PHYSICAL_ADDRESS high;
-    PHYSICAL_ADDRESS boundary;
     PVIOSND_DMA_BLOCK block;
     SIZE_T roundedSize = ROUND_TO_PAGES(Size);
 
-    low.QuadPart = 0;
-    high.QuadPart = MAXLONGLONG;
-    boundary.QuadPart = 0;
+    LogicalAddress->QuadPart = 0;
+    if (Device->DmaAdapter == NULL || roundedSize > MAXULONG) {
+        return NULL;
+    }
 
     block = (PVIOSND_DMA_BLOCK)ExAllocatePoolUninitialized(NonPagedPoolNx,
                                                            sizeof(*block),
@@ -178,12 +189,12 @@ ViosndAllocContiguous(
     if (block == NULL) {
         return NULL;
     }
+    RtlZeroMemory(block, sizeof(*block));
 
-    block->Va = MmAllocateContiguousMemorySpecifyCache(roundedSize,
-                                                       low,
-                                                       high,
-                                                       boundary,
-                                                       MmNonCached);
+    block->Va = Device->DmaAdapter->DmaOperations->AllocateCommonBuffer(Device->DmaAdapter,
+                                                                        (ULONG)roundedSize,
+                                                                        &block->LogicalAddress,
+                                                                        FALSE);
     if (block->Va == NULL) {
         ExFreePoolWithTag(block, VIOSND_POOL_TAG);
         return NULL;
@@ -191,24 +202,37 @@ ViosndAllocContiguous(
 
     block->Size = roundedSize;
     RtlZeroMemory(block->Va, roundedSize);
-    PushEntryList(&device->DmaBlocks, &block->Entry);
+    PushEntryList(&Device->DmaBlocks, &block->Entry);
+    *LogicalAddress = block->LogicalAddress;
     return block->Va;
 }
 
 static VOID
-ViosndFreeContiguous(
-    _In_ void *Context,
+ViosndFreeDmaBuffer(
+    _Inout_ PVIOSND_DEVICE Device,
     _In_ void *Virt)
 {
-    PVIOSND_DEVICE device = (PVIOSND_DEVICE)Context;
-    PSINGLE_LIST_ENTRY previous = &device->DmaBlocks;
-    PSINGLE_LIST_ENTRY current = device->DmaBlocks.Next;
+    PSINGLE_LIST_ENTRY previous;
+    PSINGLE_LIST_ENTRY current;
+
+    if (Virt == NULL) {
+        return;
+    }
+
+    previous = &Device->DmaBlocks;
+    current = Device->DmaBlocks.Next;
 
     while (current != NULL) {
         PVIOSND_DMA_BLOCK block = CONTAINING_RECORD(current, VIOSND_DMA_BLOCK, Entry);
         if (block->Va == Virt) {
             previous->Next = current->Next;
-            MmFreeContiguousMemory(block->Va);
+            if (Device->DmaAdapter != NULL) {
+                Device->DmaAdapter->DmaOperations->FreeCommonBuffer(Device->DmaAdapter,
+                                                                    (ULONG)block->Size,
+                                                                    block->LogicalAddress,
+                                                                    block->Va,
+                                                                    FALSE);
+            }
             ExFreePoolWithTag(block, VIOSND_POOL_TAG);
             return;
         }
@@ -218,12 +242,51 @@ ViosndFreeContiguous(
 }
 
 static ULONGLONG
+ViosndGetDmaAddress(
+    _Inout_ PVIOSND_DEVICE Device,
+    _In_ void *Virt)
+{
+    ULONG_PTR va = (ULONG_PTR)Virt;
+    PSINGLE_LIST_ENTRY current = Device->DmaBlocks.Next;
+
+    while (current != NULL) {
+        PVIOSND_DMA_BLOCK block = CONTAINING_RECORD(current, VIOSND_DMA_BLOCK, Entry);
+        ULONG_PTR start = (ULONG_PTR)block->Va;
+        ULONG_PTR end = start + block->Size;
+
+        if (va >= start && va < end) {
+            return block->LogicalAddress.QuadPart + (va - start);
+        }
+        current = current->Next;
+    }
+
+    return 0;
+}
+
+static void *
+ViosndAllocContiguous(
+    _In_ void *Context,
+    _In_ size_t Size)
+{
+    PHYSICAL_ADDRESS logicalAddress;
+
+    return ViosndAllocateDmaBuffer((PVIOSND_DEVICE)Context, Size, &logicalAddress);
+}
+
+static VOID
+ViosndFreeContiguous(
+    _In_ void *Context,
+    _In_ void *Virt)
+{
+    ViosndFreeDmaBuffer((PVIOSND_DEVICE)Context, Virt);
+}
+
+static ULONGLONG
 ViosndGetPhysicalAddress(
     _In_ void *Context,
     _In_ void *Virt)
 {
-    UNREFERENCED_PARAMETER(Context);
-    return MmGetPhysicalAddress(Virt).QuadPart;
+    return ViosndGetDmaAddress((PVIOSND_DEVICE)Context, Virt);
 }
 
 static void *
@@ -398,11 +461,101 @@ static VirtIOSystemOps ViosndSystemOps = {
 
 static VOID
 ViosndFreeControlBuffer(
+    _Inout_ PVIOSND_DEVICE Device,
     _In_opt_ PVOID Buffer);
 
 static NTSTATUS
 ViosndInitializeEventQueue(
     _Inout_ PVIOSND_DEVICE Device);
+
+static VOID
+ViosndKickPcmQueue(
+    _Inout_ struct virtqueue *Queue)
+{
+#if defined(_ARM64_) || defined(ARM64)
+    virtqueue_kick_always(Queue);
+#else
+    virtqueue_kick(Queue);
+#endif
+}
+
+static VOID
+ViosndPublishDmaWrites()
+{
+    KeMemoryBarrier();
+#if defined(_ARM64_) || defined(ARM64)
+    __dmb(_ARM64_BARRIER_SY);
+    KeMemoryBarrier();
+#endif
+}
+
+static VOID
+ViosndDelayMilliseconds(
+    _In_ ULONG Milliseconds)
+{
+    LARGE_INTEGER interval;
+
+    interval.QuadPart = -(10LL * 1000LL * Milliseconds);
+    KeDelayExecutionThread(KernelMode, FALSE, &interval);
+}
+
+static NTSTATUS
+ViosndAcquireTxQueue(
+    _Inout_ PVIOSND_DEVICE Device,
+    _In_z_ PCSTR Operation)
+{
+    LARGE_INTEGER timeout;
+    NTSTATUS status;
+
+    timeout.QuadPart = -(10LL * 1000LL * VIOSND_TX_MUTEX_TIMEOUT_MS);
+    status = KeWaitForSingleObject(&Device->TxQueueMutex,
+                                   Executive,
+                                   KernelMode,
+                                   FALSE,
+                                   &timeout);
+    if (status == STATUS_TIMEOUT) {
+        VIOSND_LOG(DPFLTR_IHVDRIVER_ID,
+                   DPFLTR_ERROR_LEVEL,
+                   "viosnd: tx queue mutex timeout op=%s\n",
+                   Operation);
+        return STATUS_IO_TIMEOUT;
+    }
+
+    return status;
+}
+
+VOID
+ViosndKickTxQueue(
+    _Inout_ PVIOSND_DEVICE Device)
+{
+    if (Device == NULL ||
+        Device->Queues[VIRTIO_SND_VQ_TX] == NULL) {
+        return;
+    }
+
+    if (!NT_SUCCESS(ViosndAcquireTxQueue(Device, "kick"))) {
+        return;
+    }
+    ViosndPublishDmaWrites();
+    virtqueue_kick_always(Device->Queues[VIRTIO_SND_VQ_TX]);
+    KeReleaseMutex(&Device->TxQueueMutex, FALSE);
+}
+
+static BOOLEAN
+ViosndIsPcmStatusCommand(
+    _In_ ULONG Command)
+{
+    switch (Command) {
+    case VIRTIO_SND_R_PCM_SET_PARAMS:
+    case VIRTIO_SND_R_PCM_PREPARE:
+    case VIRTIO_SND_R_PCM_START:
+    case VIRTIO_SND_R_PCM_STOP:
+    case VIRTIO_SND_R_PCM_RELEASE:
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
 
 static NTSTATUS
 ViosndSendSynchronousPnp(
@@ -481,6 +634,41 @@ ViosndReadPciHeader(
 }
 
 static NTSTATUS
+ViosndInitializeDmaAdapter(
+    _Inout_ PVIOSND_DEVICE Device)
+{
+    DEVICE_DESCRIPTION description;
+
+    if (Device->PhysicalDeviceObject == NULL) {
+        return STATUS_NO_SUCH_DEVICE;
+    }
+
+    RtlZeroMemory(&description, sizeof(description));
+    description.Version = DEVICE_DESCRIPTION_VERSION;
+    description.Master = TRUE;
+    description.ScatterGather = TRUE;
+    description.Dma32BitAddresses = FALSE;
+    description.Dma64BitAddresses = TRUE;
+    description.InterfaceType = PCIBus;
+    description.DmaWidth = Width64Bits;
+    description.DmaSpeed = Compatible;
+    description.MaximumLength = 0x0FFFFFFF;
+
+    Device->DmaAdapter = IoGetDmaAdapter(Device->PhysicalDeviceObject,
+                                         &description,
+                                         &Device->DmaMapRegisters);
+    if (Device->DmaAdapter == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    VIOSND_LOG(DPFLTR_IHVDRIVER_ID,
+               DPFLTR_ERROR_LEVEL,
+               "viosnd: DMA adapter initialized mapRegisters=%u\n",
+               Device->DmaMapRegisters);
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS
 ViosndMapBars(
     _Inout_ PVIOSND_DEVICE Device,
     _In_ PRESOURCELIST ResourceList)
@@ -549,7 +737,15 @@ ViosndInitVirtio(
     virtio_add_status(&Device->Vdev, VIRTIO_CONFIG_S_DRIVER);
 
     features = virtio_get_features(&Device->Vdev);
+    VIOSND_LOG(DPFLTR_IHVDRIVER_ID,
+               DPFLTR_ERROR_LEVEL,
+               "viosnd: host features=0x%llx\n",
+               features);
     features &= (1ULL << VIRTIO_F_VERSION_1);
+    VIOSND_LOG(DPFLTR_IHVDRIVER_ID,
+               DPFLTR_ERROR_LEVEL,
+               "viosnd: driver features=0x%llx\n",
+               features);
 
     status = virtio_set_features(&Device->Vdev, features);
     if (!NT_SUCCESS(status)) {
@@ -561,21 +757,16 @@ ViosndInitVirtio(
         goto Fail;
     }
 
-    virtio_get_config(&Device->Vdev, 0, &Device->Config, sizeof(Device->Config));
-
-    status = ViosndInitializeEventQueue(Device);
-    if (!NT_SUCCESS(status)) {
-        goto Fail;
-    }
-
     virtio_device_ready(&Device->Vdev);
     Device->VirtioInitialized = TRUE;
+
+    virtio_get_config(&Device->Vdev, 0, &Device->Config, sizeof(Device->Config));
 
     return STATUS_SUCCESS;
 
 Fail:
     for (ULONG i = 0; i < VIOSND_EVENT_BUFFER_COUNT; ++i) {
-        ViosndFreeControlBuffer(Device->EventBuffers[i].EventVa);
+        ViosndFreeControlBuffer(Device, Device->EventBuffers[i].EventVa);
         Device->EventBuffers[i].EventVa = NULL;
     }
     Device->EventBufferCount = 0;
@@ -587,38 +778,19 @@ Fail:
 
 static PVOID
 ViosndAllocControlBuffer(
+    _Inout_ PVIOSND_DEVICE Device,
     _In_ ULONG Size,
-    _Out_ PPHYSICAL_ADDRESS PhysicalAddress)
+    _Out_ PPHYSICAL_ADDRESS LogicalAddress)
 {
-    PHYSICAL_ADDRESS low;
-    PHYSICAL_ADDRESS high;
-    PHYSICAL_ADDRESS boundary;
-    PVOID buffer;
-
-    low.QuadPart = 0;
-    high.QuadPart = MAXLONGLONG;
-    boundary.QuadPart = 0;
-
-    buffer = MmAllocateContiguousMemorySpecifyCache(ROUND_TO_PAGES(Size),
-                                                   low,
-                                                   high,
-                                                   boundary,
-                                                   MmNonCached);
-    if (buffer != NULL) {
-        RtlZeroMemory(buffer, ROUND_TO_PAGES(Size));
-        *PhysicalAddress = MmGetPhysicalAddress(buffer);
-    }
-
-    return buffer;
+    return ViosndAllocateDmaBuffer(Device, Size, LogicalAddress);
 }
 
 static VOID
 ViosndFreeControlBuffer(
+    _Inout_ PVIOSND_DEVICE Device,
     _In_opt_ PVOID Buffer)
 {
-    if (Buffer != NULL) {
-        MmFreeContiguousMemory(Buffer);
-    }
+    ViosndFreeDmaBuffer(Device, Buffer);
 }
 
 static NTSTATUS
@@ -668,7 +840,8 @@ ViosndInitializeEventQueue(
 
     for (ULONG i = 0; i < VIOSND_EVENT_BUFFER_COUNT; ++i) {
         Device->EventBuffers[i].EventVa =
-            (VIRTIO_SND_EVENT *)ViosndAllocControlBuffer(sizeof(VIRTIO_SND_EVENT),
+            (VIRTIO_SND_EVENT *)ViosndAllocControlBuffer(Device,
+                                                         sizeof(VIRTIO_SND_EVENT),
                                                          &Device->EventBuffers[i].EventPa);
         if (Device->EventBuffers[i].EventVa == NULL) {
             status = STATUS_INSUFFICIENT_RESOURCES;
@@ -695,6 +868,7 @@ ViosndPollEvents(
     _Inout_ PVIOSND_DEVICE Device)
 {
     unsigned int usedLength;
+    ULONG processed = 0;
 
     if (Device == NULL ||
         Device->Queues[VIRTIO_SND_VQ_EVENT] == NULL) {
@@ -710,12 +884,22 @@ ViosndPollEvents(
     for (;;) {
         PVIOSND_EVENT_BUFFER buffer;
 
+        if (processed >= VIOSND_EVENT_POLL_BUDGET) {
+            VIOSND_LOG(DPFLTR_IHVDRIVER_ID,
+                       DPFLTR_WARNING_LEVEL,
+                       "viosnd: event poll budget exhausted count=%u\n",
+                       processed);
+            break;
+        }
+
         buffer = (PVIOSND_EVENT_BUFFER)virtqueue_get_buf(Device->Queues[VIRTIO_SND_VQ_EVENT],
                                                         &usedLength);
         if (buffer == NULL) {
             break;
         }
+        processed++;
 
+        KeMemoryBarrier();
         if (buffer->EventVa != NULL && usedLength >= sizeof(VIRTIO_SND_EVENT)) {
             switch (buffer->EventVa->hdr.code) {
             case VIRTIO_SND_EVT_PCM_PERIOD_ELAPSED:
@@ -759,14 +943,15 @@ ViosndPollEvents(
 
 static VOID
 ViosndFreeControlMessage(
+    _Inout_ PVIOSND_DEVICE Device,
     _In_opt_ PVIOSND_CONTROL_MESSAGE Message)
 {
     if (Message == NULL) {
         return;
     }
 
-    ViosndFreeControlBuffer(Message->RequestVa);
-    ViosndFreeControlBuffer(Message->ResponseVa);
+    ViosndFreeControlBuffer(Device, Message->RequestVa);
+    ViosndFreeControlBuffer(Device, Message->ResponseVa);
     ExFreePoolWithTag(Message, VIOSND_POOL_TAG);
 }
 
@@ -800,16 +985,17 @@ ViosndControlCommand(
     }
 
     RtlZeroMemory(message, sizeof(*message));
-    message->RequestVa = ViosndAllocControlBuffer(RequestLength, &message->RequestPa);
-    message->ResponseVa = ViosndAllocControlBuffer(ResponseLength, &message->ResponsePa);
+    message->RequestVa = ViosndAllocControlBuffer(Device, RequestLength, &message->RequestPa);
+    message->ResponseVa = ViosndAllocControlBuffer(Device, ResponseLength, &message->ResponsePa);
     if (message->RequestVa == NULL || message->ResponseVa == NULL) {
-        ViosndFreeControlMessage(message);
+        ViosndFreeControlMessage(Device, message);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
     message->RequestLength = RequestLength;
     message->ResponseLength = ResponseLength;
     RtlCopyMemory(message->RequestVa, Request, RequestLength);
+    KeMemoryBarrier();
 
     sg[0].physAddr = message->RequestPa;
     sg[0].length = RequestLength;
@@ -836,7 +1022,8 @@ ViosndControlCommand(
     }
     queued = TRUE;
 
-    virtqueue_kick(Device->Queues[VIRTIO_SND_VQ_CONTROL]);
+    ViosndPublishDmaWrites();
+    virtqueue_kick_always(Device->Queues[VIRTIO_SND_VQ_CONTROL]);
 
     do {
         used = virtqueue_get_buf(Device->Queues[VIRTIO_SND_VQ_CONTROL], &usedLength);
@@ -844,13 +1031,29 @@ ViosndControlCommand(
             PVIOSND_CONTROL_MESSAGE completed = (PVIOSND_CONTROL_MESSAGE)used;
 
             if (completed != message) {
-                ViosndFreeControlMessage(completed);
+                ViosndFreeControlMessage(Device, completed);
                 continue;
             }
 
+            for (ULONG i = 0; i < 100; ++i) {
+                KeMemoryBarrier();
+                if (ResponseLength < sizeof(VIRTIO_SND_HDR) ||
+                    ((VIRTIO_SND_HDR *)message->ResponseVa)->code != 0) {
+                    break;
+                }
+                KeStallExecutionProcessor(10);
+            }
             RtlCopyMemory(Response, message->ResponseVa, ResponseLength);
+            if (((const VIRTIO_SND_HDR *)Request)->code >= VIRTIO_SND_R_PCM_INFO) {
+                VIOSND_LOG(DPFLTR_IHVDRIVER_ID,
+                           DPFLTR_ERROR_LEVEL,
+                           "viosnd: control complete code=0x%x used=%u response0=0x%x\n",
+                           ((const VIRTIO_SND_HDR *)Request)->code,
+                           usedLength,
+                           ((const VIRTIO_SND_HDR *)Response)->code);
+            }
             status = STATUS_SUCCESS;
-            ViosndFreeControlMessage(message);
+            ViosndFreeControlMessage(Device, message);
             message = NULL;
             goto Exit;
         }
@@ -864,8 +1067,18 @@ ViosndControlCommand(
             KeStallExecutionProcessor(VIOSND_CONTROL_POLL_DELAY_US);
         }
         elapsedUs += VIOSND_CONTROL_POLL_DELAY_US;
+        if ((elapsedUs % VIOSND_CONTROL_RENOTIFY_US) == 0) {
+            virtqueue_kick_always(Device->Queues[VIRTIO_SND_VQ_CONTROL]);
+        }
     } while (elapsedUs < VIOSND_CONTROL_TIMEOUT_MS * 1000u);
 
+    VIOSND_LOG(DPFLTR_IHVDRIVER_ID,
+               DPFLTR_ERROR_LEVEL,
+               "viosnd: control command timeout code=0x%x request=%u response=%u elapsedUs=%u\n",
+               ((const VIRTIO_SND_HDR *)Request)->code,
+               RequestLength,
+               ResponseLength,
+               elapsedUs);
     status = STATUS_IO_TIMEOUT;
 
 Exit:
@@ -873,9 +1086,86 @@ Exit:
         KeReleaseMutex(&Device->ControlQueueMutex, FALSE);
     }
     if (message != NULL && (!queued || status != STATUS_IO_TIMEOUT)) {
-        ViosndFreeControlMessage(message);
+        ViosndFreeControlMessage(Device, message);
     }
     return status;
+}
+
+static NTSTATUS
+ViosndControlStatusCommandEx(
+    _Inout_ PVIOSND_DEVICE Device,
+    _In_reads_bytes_(RequestLength) const VOID *Request,
+    _In_ ULONG RequestLength,
+    _Out_opt_ PULONG ResponseCode)
+{
+    VIRTIO_SND_HDR response;
+    ULONG command;
+    NTSTATUS status;
+
+    command = ((const VIRTIO_SND_HDR *)Request)->code;
+    if (ResponseCode != NULL) {
+        *ResponseCode = 0;
+    }
+
+    for (ULONG attempt = 0; attempt < VIOSND_CONTROL_STATUS_RETRY_COUNT; ++attempt) {
+        RtlZeroMemory(&response, sizeof(response));
+        status = ViosndControlCommand(Device, Request, RequestLength, &response, sizeof(response));
+        if (!NT_SUCCESS(status)) {
+            return status;
+        }
+        if (ResponseCode != NULL) {
+            *ResponseCode = response.code;
+        }
+
+        if (!ViosndIsPcmStatusCommand(command) ||
+            response.code == VIRTIO_SND_S_OK) {
+            break;
+        }
+
+        if (response.code == 0 && attempt + 1 < VIOSND_CONTROL_STATUS_RETRY_COUNT) {
+            VIOSND_LOG(DPFLTR_IHVDRIVER_ID,
+                       DPFLTR_WARNING_LEVEL,
+                       "viosnd: zero pcm status command=0x%x attempt=%u retrying\n",
+                       command,
+                       attempt + 1);
+            ViosndDelayMilliseconds(VIOSND_CONTROL_STATUS_RETRY_DELAY_MS);
+            continue;
+        }
+
+        if (response.code == VIRTIO_SND_S_BAD_MSG &&
+            attempt + 1 < VIOSND_PCM_BAD_MSG_RETRY_COUNT) {
+            VIOSND_LOG(DPFLTR_IHVDRIVER_ID,
+                       DPFLTR_WARNING_LEVEL,
+                       "viosnd: BAD_MSG pcm status command=0x%x attempt=%u request=%u retrying\n",
+                       command,
+                       attempt + 1,
+                       RequestLength);
+            ViosndDelayMilliseconds(VIOSND_PCM_BAD_MSG_RETRY_DELAY_MS);
+            continue;
+        }
+
+        break;
+    }
+
+    if (response.code != VIRTIO_SND_S_OK) {
+        if (response.code == 0 && ViosndIsPcmStatusCommand(command)) {
+            VIOSND_LOG(DPFLTR_IHVDRIVER_ID,
+                       DPFLTR_WARNING_LEVEL,
+                       "viosnd: accepting zero pcm status command=0x%x after retries\n",
+                       command);
+            return STATUS_SUCCESS;
+        }
+
+        VIOSND_LOG(DPFLTR_IHVDRIVER_ID,
+                   DPFLTR_ERROR_LEVEL,
+                   "viosnd: control status command=0x%x response=0x%x pcm=%u\n",
+                   command,
+                   response.code,
+                   ViosndIsPcmStatusCommand(command));
+        return STATUS_NOT_SUPPORTED;
+    }
+
+    return STATUS_SUCCESS;
 }
 
 static NTSTATUS
@@ -884,15 +1174,7 @@ ViosndControlStatusCommand(
     _In_reads_bytes_(RequestLength) const VOID *Request,
     _In_ ULONG RequestLength)
 {
-    VIRTIO_SND_HDR response;
-    NTSTATUS status;
-
-    status = ViosndControlCommand(Device, Request, RequestLength, &response, sizeof(response));
-    if (!NT_SUCCESS(status)) {
-        return status;
-    }
-
-    return response.code == VIRTIO_SND_S_OK ? STATUS_SUCCESS : STATUS_NOT_SUPPORTED;
+    return ViosndControlStatusCommandEx(Device, Request, RequestLength, NULL);
 }
 
 static NTSTATUS
@@ -938,6 +1220,7 @@ ViosndWaitForUsedBuffer(
     do {
         PVOID used = virtqueue_get_buf(Queue, &usedLength);
         if (used == Opaque) {
+            KeMemoryBarrier();
             if (Length != NULL) {
                 *Length = usedLength;
             }
@@ -992,6 +1275,12 @@ ViosndCreateDevice(
         return status;
     }
 
+    status = ViosndInitializeDmaAdapter(device);
+    if (!NT_SUCCESS(status)) {
+        ViosndDestroyDevice(device);
+        return status;
+    }
+
     status = ViosndMapBars(device, ResourceList);
     if (!NT_SUCCESS(status)) {
         ViosndDestroyDevice(device);
@@ -1017,7 +1306,7 @@ ViosndDestroyDevice(
     }
 
     for (ULONG i = 0; i < VIOSND_EVENT_BUFFER_COUNT; ++i) {
-        ViosndFreeControlBuffer(Device->EventBuffers[i].EventVa);
+        ViosndFreeControlBuffer(Device, Device->EventBuffers[i].EventVa);
         Device->EventBuffers[i].EventVa = NULL;
     }
 
@@ -1030,8 +1319,19 @@ ViosndDestroyDevice(
     while (Device->DmaBlocks.Next != NULL) {
         PSINGLE_LIST_ENTRY entry = PopEntryList(&Device->DmaBlocks);
         PVIOSND_DMA_BLOCK block = CONTAINING_RECORD(entry, VIOSND_DMA_BLOCK, Entry);
-        MmFreeContiguousMemory(block->Va);
+        if (Device->DmaAdapter != NULL) {
+            Device->DmaAdapter->DmaOperations->FreeCommonBuffer(Device->DmaAdapter,
+                                                                (ULONG)block->Size,
+                                                                block->LogicalAddress,
+                                                                block->Va,
+                                                                FALSE);
+        }
         ExFreePoolWithTag(block, VIOSND_POOL_TAG);
+    }
+
+    if (Device->DmaAdapter != NULL) {
+        Device->DmaAdapter->DmaOperations->PutDmaAdapter(Device->DmaAdapter);
+        Device->DmaAdapter = NULL;
     }
 
     if (Device->PciBusInterfaceValid && Device->PciBus.InterfaceDereference != NULL) {
@@ -1069,6 +1369,24 @@ ViosndInitializeDevice(
     return status;
 }
 
+static BOOLEAN
+ViosndPcmInfoLooksEmpty(
+    _In_reads_(InfoCount) const VIRTIO_SND_PCM_INFO *Info,
+    _In_ ULONG InfoCount)
+{
+    for (ULONG i = 0; i < InfoCount; ++i) {
+        if (Info[i].direction != 0 ||
+            Info[i].channels_min != 0 ||
+            Info[i].channels_max != 0 ||
+            Info[i].formats != 0 ||
+            Info[i].rates != 0 ||
+            Info[i].features != 0) {
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
 NTSTATUS
 ViosndQueryPcmStreams(
     _Inout_ PVIOSND_DEVICE Device,
@@ -1104,12 +1422,20 @@ ViosndQueryPcmStreams(
     query.count = streamCount;
     query.size = sizeof(VIRTIO_SND_PCM_INFO);
 
-    status = ViosndControlCommand(Device,
-                                  &query,
-                                  sizeof(query),
-                                  response,
-                                  responseLength);
-    if (NT_SUCCESS(status)) {
+    for (ULONG attempt = 0; attempt < VIOSND_PCM_INFO_RETRY_COUNT; ++attempt) {
+        RtlZeroMemory(response, responseLength);
+        RtlZeroMemory(info, sizeof(info));
+        RtlZeroMemory(&responseHeader, sizeof(responseHeader));
+
+        status = ViosndControlCommand(Device,
+                                      &query,
+                                      sizeof(query),
+                                      response,
+                                      responseLength);
+        if (!NT_SUCCESS(status)) {
+            break;
+        }
+
         RtlCopyMemory(&responseHeader, response, sizeof(responseHeader));
         RtlCopyMemory(info,
                       response + sizeof(VIRTIO_SND_HDR),
@@ -1131,6 +1457,25 @@ ViosndQueryPcmStreams(
                        info[i].rates,
                        info[i].features);
         }
+
+        if (responseHeader.code == 0 ||
+            (responseHeader.code == VIRTIO_SND_S_OK &&
+             ViosndPcmInfoLooksEmpty(info, streamCount))) {
+            VIOSND_LOG(DPFLTR_IHVDRIVER_ID,
+                       DPFLTR_WARNING_LEVEL,
+                       "viosnd: PCM_INFO invalid/empty response attempt=%u status=0x%08x retrying\n",
+                       attempt + 1,
+                       responseHeader.code);
+
+            if (attempt + 1 < VIOSND_PCM_INFO_RETRY_COUNT) {
+                LARGE_INTEGER interval;
+
+                interval.QuadPart = -(10LL * 1000LL * VIOSND_PCM_INFO_RETRY_DELAY_MS);
+                KeDelayExecutionThread(KernelMode, FALSE, &interval);
+                continue;
+            }
+        }
+
         status = responseHeader.code == VIRTIO_SND_S_OK
                      ? ViosndFindStreamPair(info, streamCount, Pair)
                      : STATUS_NOT_SUPPORTED;
@@ -1143,7 +1488,10 @@ ViosndQueryPcmStreams(
                        Pair->HasCapture,
                        Pair->CaptureStreamId);
         }
-    } else {
+        break;
+    }
+
+    if (!NT_SUCCESS(status)) {
         VIOSND_LOG(DPFLTR_IHVDRIVER_ID,
                    DPFLTR_ERROR_LEVEL,
                    "viosnd: PCM_INFO command failed 0x%08x\n",
@@ -1163,18 +1511,42 @@ ViosndConfigurePcmFormat(
     VIRTIO_SND_PCM_SET_PARAMS params;
     VIRTIO_SND_PCM_HDR command;
     NTSTATUS status;
+    ULONG prepareResponse = 0;
 
     ViosndBuildSetParams(&params, StreamId, Format);
 
+    VIOSND_LOG(DPFLTR_IHVDRIVER_ID,
+               DPFLTR_ERROR_LEVEL,
+               "viosnd: configure stream=%u buffer=%u period=%u channels=%u format=%u rate=%u\n",
+               StreamId,
+               params.buffer_bytes,
+               params.period_bytes,
+               params.channels,
+               params.format,
+               params.rate);
     status = ViosndControlStatusCommand(Device, &params, sizeof(params));
     if (!NT_SUCCESS(status)) {
+        VIOSND_LOG(DPFLTR_IHVDRIVER_ID,
+                   DPFLTR_ERROR_LEVEL,
+                   "viosnd: SET_PARAMS failed stream=%u status=0x%08x\n",
+                   StreamId,
+                   status);
         return status;
     }
 
     RtlZeroMemory(&command, sizeof(command));
     command.hdr.code = VIRTIO_SND_R_PCM_PREPARE;
     command.stream_id = StreamId;
-    return ViosndControlStatusCommand(Device, &command, sizeof(command));
+    status = ViosndControlStatusCommandEx(Device, &command, sizeof(command), &prepareResponse);
+    if (!NT_SUCCESS(status)) {
+        VIOSND_LOG(DPFLTR_IHVDRIVER_ID,
+                   DPFLTR_ERROR_LEVEL,
+                   "viosnd: PREPARE failed stream=%u status=0x%08x response=0x%x\n",
+                   StreamId,
+                   status,
+                   prepareResponse);
+    }
+    return status;
 }
 
 NTSTATUS
@@ -1185,6 +1557,17 @@ ViosndConfigureDefaultPcm(
     VIOSND_PCM_FORMAT format;
 
     ViosndGetDefaultPcmFormat(&format);
+    return ViosndConfigurePcmFormat(Device, StreamId, &format);
+}
+
+NTSTATUS
+ViosndConfigureFallbackPcm(
+    _Inout_ PVIOSND_DEVICE Device,
+    _In_ ULONG StreamId)
+{
+    VIOSND_PCM_FORMAT format;
+
+    ViosndGetFallbackPcmFormat(&format);
     return ViosndConfigurePcmFormat(Device, StreamId, &format);
 }
 
@@ -1239,16 +1622,21 @@ ViosndWritePcm(
     }
 
     requestLength = sizeof(*request) + Length;
-    request = (struct _WRITE_MESSAGE *)ViosndAllocControlBuffer(requestLength, &requestPa);
-    status = (VIRTIO_SND_PCM_STATUS *)ViosndAllocControlBuffer(sizeof(*status), &statusPa);
+    request = (struct _WRITE_MESSAGE *)ViosndAllocControlBuffer(Device,
+                                                                requestLength,
+                                                                &requestPa);
+    status = (VIRTIO_SND_PCM_STATUS *)ViosndAllocControlBuffer(Device,
+                                                               sizeof(*status),
+                                                               &statusPa);
     if (request == NULL || status == NULL) {
-        ViosndFreeControlBuffer(request);
-        ViosndFreeControlBuffer(status);
+        ViosndFreeControlBuffer(Device, request);
+        ViosndFreeControlBuffer(Device, status);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
     request->Header.stream_id = StreamId;
     RtlCopyMemory((PUCHAR)request + sizeof(*request), Buffer, Length);
+    KeMemoryBarrier();
 
     sg[0].physAddr = requestPa;
     sg[0].length = requestLength;
@@ -1258,7 +1646,7 @@ ViosndWritePcm(
     if (virtqueue_add_buf(Device->Queues[VIRTIO_SND_VQ_TX], sg, 1, 1, request, NULL, 0) < 0) {
         result = STATUS_DEVICE_BUSY;
     } else {
-        virtqueue_kick(Device->Queues[VIRTIO_SND_VQ_TX]);
+        ViosndKickPcmQueue(Device->Queues[VIRTIO_SND_VQ_TX]);
         result = ViosndWaitForUsedBuffer(Device->Queues[VIRTIO_SND_VQ_TX], request, NULL);
         if (NT_SUCCESS(result)) {
             result = status->status == VIRTIO_SND_S_OK ? STATUS_SUCCESS : STATUS_IO_DEVICE_ERROR;
@@ -1268,13 +1656,14 @@ ViosndWritePcm(
         }
     }
 
-    ViosndFreeControlBuffer(request);
-    ViosndFreeControlBuffer(status);
+    ViosndFreeControlBuffer(Device, request);
+    ViosndFreeControlBuffer(Device, status);
     return result;
 }
 
 NTSTATUS
 ViosndAllocateWritePcmIo(
+    _Inout_ PVIOSND_DEVICE Device,
     _In_ ULONG MaxAudioLength,
     _Outptr_ PVIOSND_PCM_IO *Io)
 {
@@ -1290,12 +1679,13 @@ ViosndAllocateWritePcmIo(
     RtlZeroMemory(io, sizeof(*io));
 
     io->RequestLength = sizeof(VIRTIO_SND_PCM_XFER) + MaxAudioLength;
-    io->RequestVa = ViosndAllocControlBuffer(io->RequestLength, &io->RequestPa);
-    io->StatusVa = (VIRTIO_SND_PCM_STATUS *)ViosndAllocControlBuffer(sizeof(*io->StatusVa),
+    io->RequestVa = ViosndAllocControlBuffer(Device, io->RequestLength, &io->RequestPa);
+    io->StatusVa = (VIRTIO_SND_PCM_STATUS *)ViosndAllocControlBuffer(Device,
+                                                                     sizeof(*io->StatusVa),
                                                                      &io->StatusPa);
     if (io->RequestVa == NULL || io->StatusVa == NULL) {
-        ViosndFreeControlBuffer(io->RequestVa);
-        ViosndFreeControlBuffer(io->StatusVa);
+        ViosndFreeControlBuffer(Device, io->RequestVa);
+        ViosndFreeControlBuffer(Device, io->StatusVa);
         ExFreePoolWithTag(io, VIOSND_POOL_TAG);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
@@ -1306,19 +1696,21 @@ ViosndAllocateWritePcmIo(
 
 VOID
 ViosndFreeWritePcmIo(
+    _Inout_ PVIOSND_DEVICE Device,
     _In_opt_ PVIOSND_PCM_IO Io)
 {
     if (Io == NULL) {
         return;
     }
 
-    ViosndFreeControlBuffer(Io->RequestVa);
-    ViosndFreeControlBuffer(Io->StatusVa);
+    ViosndFreeControlBuffer(Device, Io->RequestVa);
+    ViosndFreeControlBuffer(Device, Io->StatusVa);
     ExFreePoolWithTag(Io, VIOSND_POOL_TAG);
 }
 
 NTSTATUS
 ViosndAllocateReadPcmIo(
+    _Inout_ PVIOSND_DEVICE Device,
     _In_ ULONG MaxAudioLength,
     _Outptr_ PVIOSND_PCM_IO *Io)
 {
@@ -1334,12 +1726,13 @@ ViosndAllocateReadPcmIo(
     RtlZeroMemory(io, sizeof(*io));
 
     io->RequestLength = sizeof(VIRTIO_SND_PCM_XFER);
-    io->RequestVa = ViosndAllocControlBuffer(io->RequestLength, &io->RequestPa);
-    io->AudioVa = ViosndAllocControlBuffer(MaxAudioLength + sizeof(VIRTIO_SND_PCM_STATUS),
+    io->RequestVa = ViosndAllocControlBuffer(Device, io->RequestLength, &io->RequestPa);
+    io->AudioVa = ViosndAllocControlBuffer(Device,
+                                           MaxAudioLength + sizeof(VIRTIO_SND_PCM_STATUS),
                                            &io->AudioPa);
     if (io->RequestVa == NULL || io->AudioVa == NULL) {
-        ViosndFreeControlBuffer(io->RequestVa);
-        ViosndFreeControlBuffer(io->AudioVa);
+        ViosndFreeControlBuffer(Device, io->RequestVa);
+        ViosndFreeControlBuffer(Device, io->AudioVa);
         ExFreePoolWithTag(io, VIOSND_POOL_TAG);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
@@ -1351,14 +1744,15 @@ ViosndAllocateReadPcmIo(
 
 VOID
 ViosndFreeReadPcmIo(
+    _Inout_ PVIOSND_DEVICE Device,
     _In_opt_ PVIOSND_PCM_IO Io)
 {
     if (Io == NULL) {
         return;
     }
 
-    ViosndFreeControlBuffer(Io->RequestVa);
-    ViosndFreeControlBuffer(Io->AudioVa);
+    ViosndFreeControlBuffer(Device, Io->RequestVa);
+    ViosndFreeControlBuffer(Device, Io->AudioVa);
     ExFreePoolWithTag(Io, VIOSND_POOL_TAG);
 }
 
@@ -1368,11 +1762,14 @@ ViosndSubmitPreparedWritePcm(
     _In_ ULONG StreamId,
     _In_reads_bytes_(Length) const VOID *Buffer,
     _In_ ULONG Length,
+    _In_ ULONG SourceLength,
+    _In_ ULONG PacketNumber,
     _Inout_ PVIOSND_PCM_IO Io)
 {
     VIRTIO_SND_PCM_XFER *header;
     VirtIOBufferDescriptor sg[2];
     ULONG requestLength;
+    NTSTATUS status;
 
     if (Device->Queues[VIRTIO_SND_VQ_TX] == NULL) {
         return STATUS_DEVICE_NOT_READY;
@@ -1391,26 +1788,28 @@ ViosndSubmitPreparedWritePcm(
     header->stream_id = StreamId;
     RtlCopyMemory((PUCHAR)Io->RequestVa + sizeof(*header), Buffer, Length);
     Io->AudioLength = Length;
-    Io->PacketNumber = 0;
+    Io->SourceLength = SourceLength != 0 ? SourceLength : Length;
+    Io->PacketNumber = PacketNumber;
     Io->StreamId = StreamId;
+    KeMemoryBarrier();
 
     sg[0].physAddr = Io->RequestPa;
     sg[0].length = requestLength;
     sg[1].physAddr = Io->StatusPa;
     sg[1].length = sizeof(*Io->StatusVa);
 
-    KeWaitForSingleObject(&Device->TxQueueMutex,
-                          Executive,
-                          KernelMode,
-                          FALSE,
-                          NULL);
+    status = ViosndAcquireTxQueue(Device, "submit");
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
 
     if (virtqueue_add_buf(Device->Queues[VIRTIO_SND_VQ_TX], sg, 1, 1, Io, NULL, 0) < 0) {
         KeReleaseMutex(&Device->TxQueueMutex, FALSE);
         return STATUS_DEVICE_BUSY;
     }
 
-    virtqueue_kick(Device->Queues[VIRTIO_SND_VQ_TX]);
+    ViosndPublishDmaWrites();
+    ViosndKickPcmQueue(Device->Queues[VIRTIO_SND_VQ_TX]);
     KeReleaseMutex(&Device->TxQueueMutex, FALSE);
     return STATUS_SUCCESS;
 }
@@ -1425,14 +1824,14 @@ ViosndSubmitWritePcm(
     PVIOSND_PCM_IO io;
     NTSTATUS status;
 
-    status = ViosndAllocateWritePcmIo(Length, &io);
+    status = ViosndAllocateWritePcmIo(Device, Length, &io);
     if (!NT_SUCCESS(status)) {
         return status;
     }
 
-    status = ViosndSubmitPreparedWritePcm(Device, StreamId, Buffer, Length, io);
+    status = ViosndSubmitPreparedWritePcm(Device, StreamId, Buffer, Length, Length, 0, io);
     if (!NT_SUCCESS(status)) {
-        ViosndFreeWritePcmIo(io);
+        ViosndFreeWritePcmIo(Device, io);
     }
     return status;
 }
@@ -1447,6 +1846,7 @@ ViosndReclaimPreparedWritePcm(
     unsigned int usedLength;
     PVIOSND_PCM_IO io;
     NTSTATUS status;
+    ULONG pcmStatus;
 
     if (Io != NULL) {
         *Io = NULL;
@@ -1462,19 +1862,36 @@ ViosndReclaimPreparedWritePcm(
         return STATUS_DEVICE_NOT_READY;
     }
 
-    KeWaitForSingleObject(&Device->TxQueueMutex,
-                          Executive,
-                          KernelMode,
-                          FALSE,
-                          NULL);
+    status = ViosndAcquireTxQueue(Device, "reclaim");
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
     io = (PVIOSND_PCM_IO)virtqueue_get_buf(Device->Queues[VIRTIO_SND_VQ_TX], &usedLength);
     KeReleaseMutex(&Device->TxQueueMutex, FALSE);
     if (io == NULL) {
         return STATUS_NOT_FOUND;
     }
 
-    UNREFERENCED_PARAMETER(usedLength);
-    status = io->StatusVa->status == VIRTIO_SND_S_OK ? STATUS_SUCCESS : STATUS_IO_DEVICE_ERROR;
+    KeMemoryBarrier();
+    /*
+     * For playback the used buffer is the reliable completion signal.  Some
+     * transports have been observed to complete TX buffers while leaving the
+     * optional status payload as zero, especially on ARM64, and failing the
+     * reclaim path prevents WaveRT position from advancing.
+     */
+    pcmStatus = io->StatusVa->status;
+    status = STATUS_SUCCESS;
+    if (pcmStatus != 0 && pcmStatus != VIRTIO_SND_S_OK) {
+        VIOSND_LOG(DPFLTR_IHVDRIVER_ID,
+                   DPFLTR_ERROR_LEVEL,
+                   "viosnd: write complete stream=%u packet=%u used=%u pcmStatus=0x%x latency=%u length=%u accepted=1\n",
+                   io->StreamId,
+                   io->PacketNumber,
+                   usedLength,
+                   pcmStatus,
+                   io->StatusVa->latency_bytes,
+                   io->AudioLength);
+    }
     if (LatencyBytes != NULL) {
         *LatencyBytes = io->StatusVa->latency_bytes;
     }
@@ -1485,6 +1902,37 @@ ViosndReclaimPreparedWritePcm(
         *Io = io;
     }
     return status;
+}
+
+NTSTATUS
+ViosndDetachUnusedWritePcm(
+    _Inout_ PVIOSND_DEVICE Device,
+    _Outptr_opt_result_maybenull_ PVIOSND_PCM_IO *Io)
+{
+    PVIOSND_PCM_IO io;
+
+    if (Io != NULL) {
+        *Io = NULL;
+    }
+
+    if (Device->Queues[VIRTIO_SND_VQ_TX] == NULL) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    NTSTATUS status = ViosndAcquireTxQueue(Device, "detach");
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+    io = (PVIOSND_PCM_IO)virtqueue_detach_unused_buf(Device->Queues[VIRTIO_SND_VQ_TX]);
+    KeReleaseMutex(&Device->TxQueueMutex, FALSE);
+    if (io == NULL) {
+        return STATUS_NOT_FOUND;
+    }
+
+    if (Io != NULL) {
+        *Io = io;
+    }
+    return STATUS_SUCCESS;
 }
 
 NTSTATUS
@@ -1515,6 +1963,7 @@ ViosndSubmitPreparedReadPcm(
     Io->StreamId = StreamId;
     Io->AudioLength = Length;
     Io->PacketNumber = PacketNumber;
+    KeMemoryBarrier();
 
     sg[0].physAddr = Io->RequestPa;
     sg[0].length = sizeof(*header);
@@ -1532,7 +1981,8 @@ ViosndSubmitPreparedReadPcm(
         return STATUS_DEVICE_BUSY;
     }
 
-    virtqueue_kick(Device->Queues[VIRTIO_SND_VQ_RX]);
+    ViosndPublishDmaWrites();
+    ViosndKickPcmQueue(Device->Queues[VIRTIO_SND_VQ_RX]);
     KeReleaseMutex(&Device->RxQueueMutex, FALSE);
     return STATUS_SUCCESS;
 }
@@ -1574,6 +2024,7 @@ ViosndReclaimPreparedReadPcm(
         return STATUS_NOT_FOUND;
     }
 
+    KeMemoryBarrier();
     if (usedLength < sizeof(VIRTIO_SND_PCM_STATUS)) {
         statusVa = NULL;
         status = STATUS_IO_DEVICE_ERROR;
@@ -1618,7 +2069,7 @@ ViosndDetachUnusedReadPcm(
         if (io == NULL) {
             break;
         }
-        ViosndFreeReadPcmIo(io);
+        ViosndFreeReadPcmIo(Device, io);
         count++;
     }
     KeReleaseMutex(&Device->RxQueueMutex, FALSE);
@@ -1644,6 +2095,13 @@ ViosndGetPcmIoPacketNumber(
     return Io != NULL ? Io->PacketNumber : 0;
 }
 
+ULONG
+ViosndGetPcmIoSourceLength(
+    _In_ PVIOSND_PCM_IO Io)
+{
+    return Io != NULL ? Io->SourceLength : 0;
+}
+
 NTSTATUS
 ViosndReclaimWritePcm(
     _Inout_ PVIOSND_DEVICE Device,
@@ -1654,7 +2112,7 @@ ViosndReclaimWritePcm(
 
     status = ViosndReclaimPreparedWritePcm(Device, &io, BytesWritten, NULL);
     if (status != STATUS_NOT_FOUND) {
-        ViosndFreeWritePcmIo(io);
+        ViosndFreeWritePcmIo(Device, io);
     }
     return status;
 }
@@ -1686,15 +2144,18 @@ ViosndReadPcm(
     }
 
     responseLength = Length + sizeof(VIRTIO_SND_PCM_STATUS);
-    request = (VIRTIO_SND_PCM_XFER *)ViosndAllocControlBuffer(sizeof(*request), &requestPa);
-    response = ViosndAllocControlBuffer(responseLength, &responsePa);
+    request = (VIRTIO_SND_PCM_XFER *)ViosndAllocControlBuffer(Device,
+                                                              sizeof(*request),
+                                                              &requestPa);
+    response = ViosndAllocControlBuffer(Device, responseLength, &responsePa);
     if (request == NULL || response == NULL) {
-        ViosndFreeControlBuffer(request);
-        ViosndFreeControlBuffer(response);
+        ViosndFreeControlBuffer(Device, request);
+        ViosndFreeControlBuffer(Device, response);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
     request->stream_id = StreamId;
+    KeMemoryBarrier();
     sg[0].physAddr = requestPa;
     sg[0].length = sizeof(*request);
     sg[1].physAddr = responsePa;
@@ -1703,7 +2164,7 @@ ViosndReadPcm(
     if (virtqueue_add_buf(Device->Queues[VIRTIO_SND_VQ_RX], sg, 1, 1, request, NULL, 0) < 0) {
         result = STATUS_DEVICE_BUSY;
     } else {
-        virtqueue_kick(Device->Queues[VIRTIO_SND_VQ_RX]);
+        ViosndKickPcmQueue(Device->Queues[VIRTIO_SND_VQ_RX]);
         result = ViosndWaitForUsedBuffer(Device->Queues[VIRTIO_SND_VQ_RX], request, &usedLength);
         if (NT_SUCCESS(result)) {
             if (usedLength < sizeof(status) || usedLength > responseLength) {
@@ -1732,7 +2193,7 @@ ViosndReadPcm(
                    usedLength);
     }
 
-    ViosndFreeControlBuffer(request);
-    ViosndFreeControlBuffer(response);
+    ViosndFreeControlBuffer(Device, request);
+    ViosndFreeControlBuffer(Device, response);
     return result;
 }

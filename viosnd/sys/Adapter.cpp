@@ -70,6 +70,46 @@ ViosndReadDeviceDword(
 }
 
 static
+VOID
+ViosndWriteDeviceInitDiag(
+    _In_ PDEVICE_OBJECT PhysicalDeviceObject,
+    _In_z_ PCWSTR Stage,
+    _In_ NTSTATUS Status)
+{
+    HANDLE key = NULL;
+    NTSTATUS openStatus;
+    UNICODE_STRING valueName;
+    UNICODE_STRING value;
+
+    openStatus = IoOpenDeviceRegistryKey(PhysicalDeviceObject,
+                                         PLUGPLAY_REGKEY_DEVICE,
+                                         KEY_SET_VALUE,
+                                         &key);
+    if (!NT_SUCCESS(openStatus)) {
+        return;
+    }
+
+    RtlInitUnicodeString(&valueName, L"LastInitStage");
+    RtlInitUnicodeString(&value, Stage);
+    (VOID)ZwSetValueKey(key,
+                        &valueName,
+                        0,
+                        REG_SZ,
+                        value.Buffer,
+                        value.Length + sizeof(WCHAR));
+
+    RtlInitUnicodeString(&valueName, L"LastInitStatus");
+    (VOID)ZwSetValueKey(key,
+                        &valueName,
+                        0,
+                        REG_DWORD,
+                        &Status,
+                        sizeof(Status));
+
+    ZwClose(key);
+}
+
+static
 NTSTATUS
 ViosndCreateAndRegisterWaveRTSubdevice(
     _In_ PDEVICE_OBJECT DeviceObject,
@@ -274,6 +314,7 @@ XcbVirtioAudioStartDevice(
                    status);
         return status;
     }
+    ViosndWriteDeviceInitDiag(physicalDeviceObject, L"Start", STATUS_PENDING);
 
     endpointRole = ViosndReadDeviceDword(physicalDeviceObject,
                                          L"EndpointRole",
@@ -289,6 +330,7 @@ XcbVirtioAudioStartDevice(
                enableCapture);
 
     status = ViosndCreateDevice(DeviceObject, physicalDeviceObject, ResourceList, &device);
+    ViosndWriteDeviceInitDiag(physicalDeviceObject, L"CreateDevice", status);
     if (!NT_SUCCESS(status)) {
         VIOSND_LOG(DPFLTR_IHVDRIVER_ID,
                    DPFLTR_ERROR_LEVEL,
@@ -298,8 +340,10 @@ XcbVirtioAudioStartDevice(
     }
 
     status = ViosndInitializeDevice(device);
+    ViosndWriteDeviceInitDiag(physicalDeviceObject, L"InitializeDevice", status);
     if (NT_SUCCESS(status)) {
         status = ViosndQueryPcmStreams(device, &streams);
+        ViosndWriteDeviceInitDiag(physicalDeviceObject, L"QueryPcmStreams", status);
     }
 
     if (!NT_SUCCESS(status)) {
@@ -311,20 +355,25 @@ XcbVirtioAudioStartDevice(
         return status;
     }
 
-    if (enableRender && streams.HasRender) {
-        status = ViosndConfigureDefaultPcm(device, streams.RenderStreamId);
-    }
-
-    if (NT_SUCCESS(status) && enableCapture && streams.HasCapture) {
-        status = ViosndConfigureDefaultPcm(device, streams.CaptureStreamId);
-    }
-
     if (NT_SUCCESS(status) && enableRender && !streams.HasRender) {
         status = STATUS_DEVICE_CONFIGURATION_ERROR;
+        ViosndWriteDeviceInitDiag(physicalDeviceObject, L"MissingRenderStream", status);
     }
 
     if (NT_SUCCESS(status) && enableCapture && !streams.HasCapture) {
         status = STATUS_DEVICE_CONFIGURATION_ERROR;
+        ViosndWriteDeviceInitDiag(physicalDeviceObject, L"MissingCaptureStream", status);
+    }
+
+    if (NT_SUCCESS(status)) {
+        ViosndWriteDeviceInitDiag(physicalDeviceObject, L"PcmConfigureDeferred", status);
+        VIOSND_LOG(DPFLTR_IHVDRIVER_ID,
+                   DPFLTR_ERROR_LEVEL,
+                   "viosnd: defer PCM configure render=%u/%u capture=%u/%u\n",
+                   streams.HasRender,
+                   streams.RenderStreamId,
+                   streams.HasCapture,
+                   streams.CaptureStreamId);
     }
 
     if (!NT_SUCCESS(status)) {
@@ -349,6 +398,7 @@ XcbVirtioAudioStartDevice(
                                              FALSE,
                                              VIOSND_TOPOOUT_NAME,
                                              VIOSND_WAVEOUT_NAME);
+        ViosndWriteDeviceInitDiag(physicalDeviceObject, L"RegisterRender", status);
     }
 
     if (NT_SUCCESS(status) && enableCapture && streams.HasCapture) {
@@ -360,6 +410,7 @@ XcbVirtioAudioStartDevice(
                                              TRUE,
                                              VIOSND_TOPOIN_NAME,
                                              VIOSND_WAVEIN_NAME);
+        ViosndWriteDeviceInitDiag(physicalDeviceObject, L"RegisterCapture", status);
     }
 
     if (!NT_SUCCESS(status)) {
@@ -372,5 +423,6 @@ XcbVirtioAudioStartDevice(
     }
 
     g_ViosndDevice = device;
+    ViosndWriteDeviceInitDiag(physicalDeviceObject, L"Started", status);
     return status;
 }
