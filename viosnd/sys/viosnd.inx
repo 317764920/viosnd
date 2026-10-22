@@ -33,15 +33,36 @@ viosnd.sys = 1,,
 %VENDOR% = Standard,NT$ARCH$
 
 [Standard.NT$ARCH$]
+; Virtualization.framework's virtio-snd (PCI subsystem id 0x0059) has playback streams only
+; unless the host adds an input stream, so it gets a render-only endpoint role.
+%XcbVirtioAudio.DeviceDesc% = XcbVirtioAudio_Apple_Device, PCI\VEN_1AF4&DEV_1059&SUBSYS_00591AF4
 %XcbVirtioAudio.DeviceDesc% = XcbVirtioAudio_Device, PCI\VEN_1AF4&DEV_1059&SUBSYS_1100_INX_SUBSYS_VENDOR_ID&REV_01, PCI\VEN_1AF4&DEV_1059
 
 [XcbVirtioAudio_Device.NT]
 CopyFiles = XcbVirtioAudio_CopyFiles
 
 [XcbVirtioAudio_Device.NT.HW]
-AddReg = XcbVirtioAudio_AddReg
+AddReg = XcbVirtioAudio_AddReg, XcbVirtioAudio_Role_Both
+
+[XcbVirtioAudio_Apple_Device.NT]
+CopyFiles = XcbVirtioAudio_CopyFiles
+
+[XcbVirtioAudio_Apple_Device.NT.HW]
+AddReg = XcbVirtioAudio_AddReg, XcbVirtioAudio_Role_Render
 
 [XcbVirtioAudio_Device.NT.Interfaces]
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_WaveOut%,     XcbVirtioAudio.I.WaveOut
+AddInterface = %KSCATEGORY_RENDER%,   %KSNAME_WaveOut%,     XcbVirtioAudio.I.WaveOut
+AddInterface = %KSCATEGORY_REALTIME%, %KSNAME_WaveOut%,     XcbVirtioAudio.I.WaveOut
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_TopologyOut%, XcbVirtioAudio.I.TopologyOut
+AddInterface = %KSCATEGORY_TOPOLOGY%, %KSNAME_TopologyOut%, XcbVirtioAudio.I.TopologyOut
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_WaveIn%,      XcbVirtioAudio.I.WaveIn
+AddInterface = %KSCATEGORY_CAPTURE%,  %KSNAME_WaveIn%,      XcbVirtioAudio.I.WaveIn
+AddInterface = %KSCATEGORY_REALTIME%, %KSNAME_WaveIn%,      XcbVirtioAudio.I.WaveIn
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_TopologyIn%,  XcbVirtioAudio.I.TopologyIn
+AddInterface = %KSCATEGORY_TOPOLOGY%, %KSNAME_TopologyIn%,  XcbVirtioAudio.I.TopologyIn
+
+[XcbVirtioAudio_Apple_Device.NT.Interfaces]
 AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_WaveOut%,     XcbVirtioAudio.I.WaveOut
 AddInterface = %KSCATEGORY_RENDER%,   %KSNAME_WaveOut%,     XcbVirtioAudio.I.WaveOut
 AddInterface = %KSCATEGORY_REALTIME%, %KSNAME_WaveOut%,     XcbVirtioAudio.I.WaveOut
@@ -61,7 +82,12 @@ HKR,Interrupt Management,,0x00000010
 HKR,Interrupt Management\MessageSignaledInterruptProperties,,0x00000010
 HKR,Interrupt Management\MessageSignaledInterruptProperties,MSISupported,0x00010001,1
 HKR,Interrupt Management\MessageSignaledInterruptProperties,MessageNumberLimit,0x00010001,4
+
+[XcbVirtioAudio_Role_Both]
 HKR,,EndpointRole,0x00010001,2
+
+[XcbVirtioAudio_Role_Render]
+HKR,,EndpointRole,0x00010001,0
 
 [XcbVirtioAudio.I.WaveOut]
 AddReg = XcbVirtioAudio.I.WaveOut.AddReg
@@ -89,6 +115,9 @@ HKR,,FriendlyName,,%XcbVirtioAudio.TopologyIn%
 HKR,EP\0,%PKEY_AudioEndpoint_Default_VolumeInDb%,0x00010001,0x00000000
 
 [XcbVirtioAudio_Device.NT.Services]
+AddService = viosnd,0x00000002,XcbVirtioAudio_Service_Install
+
+[XcbVirtioAudio_Apple_Device.NT.Services]
 AddService = viosnd,0x00000002,XcbVirtioAudio_Service_Install
 
 [XcbVirtioAudio_Service_Install]
